@@ -11,6 +11,7 @@ public sealed class OpenRgbService : IOpenRgbService
 {
     private OpenRgbClient? _client;
     private readonly object _gate = new();
+    private int _timeoutMs = 1500;
 
     public bool IsConnected
     {
@@ -33,6 +34,7 @@ public sealed class OpenRgbService : IOpenRgbService
             DisconnectInternal();
             Host = string.IsNullOrWhiteSpace(host) ? "127.0.0.1" : host.Trim();
             Port = port <= 0 ? 6742 : port;
+            _timeoutMs = timeoutMs <= 0 ? 1500 : timeoutMs;
 
             try
             {
@@ -41,7 +43,7 @@ public sealed class OpenRgbService : IOpenRgbService
                     port: Port,
                     name: "UnifiedRgb",
                     autoConnect: false,
-                    timeoutMs: timeoutMs);
+                    timeoutMs: _timeoutMs);
 
                 _client.Connect();
 
@@ -157,33 +159,132 @@ public sealed class OpenRgbService : IOpenRgbService
         lock (_gate)
         {
             EnsureConnected();
+            Zone zone;
             try
             {
-                if (ledCount < 0)
-                    throw new ArgumentOutOfRangeException(nameof(ledCount), "LED count must be >= 0.");
+                zone = ValidateZoneSize(deviceIndex, zoneIndex, ledCount);
 
-                var device = _client!.GetControllerData(deviceIndex);
-                if (zoneIndex < 0 || zoneIndex >= device.Zones.Length)
-                    throw new ArgumentOutOfRangeException(nameof(zoneIndex), $"Zone {zoneIndex} is out of range.");
+                // OpenRGB.NET ResizeZone maps to packet 1000. That is a no-op when the
+                // driver did not set ZONE_FLAG_MANUALLY_CONFIGURABLE_SIZE (CM ARGB Gen2).
+                _client!.ResizeZone(deviceIndex, zoneIndex, ledCount);
 
-                var zone = device.Zones[zoneIndex];
-                if (zone.LedsMax > 0 && (uint)ledCount > zone.LedsMax)
-                    throw new ArgumentOutOfRangeException(nameof(ledCount),
-                        $"LED count {ledCount} exceeds zone max {zone.LedsMax}.");
-                if (zone.LedsMin > 0 && (uint)ledCount < zone.LedsMin && ledCount != 0)
-                    throw new ArgumentOutOfRangeException(nameof(ledCount),
-                        $"LED count {ledCount} is below zone min {zone.LedsMin}.");
-
-                _client.ResizeZone(deviceIndex, zoneIndex, ledCount);
-                LastError = null;
+                var after = _client.GetControllerData(deviceIndex).Zones[zoneIndex];
+                if (after.LedCount == (uint)ledCount)
+                {
+                    LastError = null;
+                    return;
+                }
             }
             catch (Exception ex) when (ex is not ArgumentOutOfRangeException)
             {
                 HandleLostConnection(ex);
                 throw;
             }
+
+            // Fallback: protocol 6 ConfigureZone (packet 1003) on a dedicated TCP
+            // connection. OpenRGB.NET 3.1.1 max protocol is 4 and has no ConfigureZone;
+            // injecting into its socket would parse Zone Data without flags.
+            try
+            {
+                ConfigureZoneLocked(deviceIndex, zoneIndex, ledCount, zone);
+                LastError = null;
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                throw new InvalidOperationException(ex.Message, ex);
+            }
         }
     }
+
+    public void ConfigureZone(int deviceIndex, int zoneIndex, int ledCount)
+    {
+        lock (_gate)
+        {
+            EnsureConnected();
+            Zone zone;
+            try
+            {
+                zone = ValidateZoneSize(deviceIndex, zoneIndex, ledCount);
+            }
+            catch (Exception ex) when (ex is not ArgumentOutOfRangeException)
+            {
+                HandleLostConnection(ex);
+                throw;
+            }
+
+            try
+            {
+                ConfigureZoneLocked(deviceIndex, zoneIndex, ledCount, zone);
+                LastError = null;
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                throw new InvalidOperationException(ex.Message, ex);
+            }
+        }
+    }
+
+    private Zone ValidateZoneSize(int deviceIndex, int zoneIndex, int ledCount)
+    {
+        if (ledCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(ledCount), "LED count must be >= 0.");
+
+        var device = _client!.GetControllerData(deviceIndex);
+        if (zoneIndex < 0 || zoneIndex >= device.Zones.Length)
+            throw new ArgumentOutOfRangeException(nameof(zoneIndex), $"Zone {zoneIndex} is out of range.");
+
+        var zone = device.Zones[zoneIndex];
+        if (zone.LedsMax > 0 && (uint)ledCount > zone.LedsMax)
+            throw new ArgumentOutOfRangeException(nameof(ledCount),
+                $"LED count {ledCount} exceeds zone max {zone.LedsMax}.");
+        if (zone.LedsMin > 0 && (uint)ledCount < zone.LedsMin && ledCount != 0)
+            throw new ArgumentOutOfRangeException(nameof(ledCount),
+                $"LED count {ledCount} is below zone min {zone.LedsMin}.");
+        return zone;
+    }
+
+    private void ConfigureZoneLocked(int deviceIndex, int zoneIndex, int ledCount, Zone zone)
+    {
+        OpenRgbConfigureZoneClient.ConfigureZone(
+            Host,
+            Port,
+            Math.Max(_timeoutMs, 2000),
+            deviceIndex,
+            zoneIndex,
+            new OpenRgbZoneConfig
+            {
+                Name = zone.Name ?? $"Zone {zoneIndex}",
+                Type = MapZoneType(zone.Type),
+                LedsMin = zone.LedsMin,
+                LedsMax = zone.LedsMax > 0 ? zone.LedsMax : 72,
+                LedsCount = (uint)ledCount,
+                Flags = OpenRgbConfigureZoneClient.ZoneFlagManuallyConfigurableSize
+                      | OpenRgbConfigureZoneClient.ZoneFlagManuallyConfiguredSize
+            });
+
+        var verify = _client!.GetControllerData(deviceIndex);
+        if (zoneIndex >= verify.Zones.Length)
+            throw new InvalidOperationException("Zone disappeared after ConfigureZone.");
+
+        var after = verify.Zones[zoneIndex];
+        if (after.LedCount != (uint)ledCount)
+        {
+            throw new InvalidOperationException(
+                $"ConfigureZone did not change LED count (still {after.LedCount}, wanted {ledCount}). " +
+                "OpenRGB 1.0+ SDK is required; OpenRGB GUI also hides Edit Zone for CM Gen2.");
+        }
+    }
+
+    private static int MapZoneType(ZoneType type) =>
+        type switch
+        {
+            ZoneType.Single => 0,
+            ZoneType.Linear => OpenRgbConfigureZoneClient.ZoneTypeLinear,
+            ZoneType.Matrix => 2,
+            _ => OpenRgbConfigureZoneClient.ZoneTypeLinear
+        };
 
     /// <summary>
     /// Hardware brightness via OpenRGB mode flags.

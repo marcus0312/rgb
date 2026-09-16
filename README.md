@@ -19,7 +19,7 @@ This client does **not** install OpenRGB and does **not** require Administrator 
 | Gear | Notes |
 |------|--------|
 | GALAX RTX 2070 Super | GPU SMBus RGB via OpenRGB Galax detector; needs PawnIO |
-| Cooler Master ARGB Gen2 A1 V2 | USB HID; quit MasterPlus+ first. Channels often report **0 LEDs** until you **ResizeZone** (typically **24**). |
+| Cooler Master ARGB Gen2 A1 V2 | USB HID; quit MasterPlus+ first. Channels often report **0 LEDs**. OpenRGB UI hides **Edit Zone** (driver omits `ZONE_FLAG_MANUALLY_CONFIGURABLE_SIZE`); this app uses **ConfigureZone** (typically **24**). |
 | ASRock B450 Steel Legend | Polychrome (SMBus or USB depending on board revision) |
 | Logitech G502 | Often detected as a mouse device in OpenRGB |
 
@@ -55,9 +55,9 @@ On Windows, start OpenRGB → **SDK Server** → **Start Server**, then click **
 
 1. Connect to OpenRGB SDK  
 2. List devices (name, zones, LED counts, mode)  
-3. **Channel/zone picker** + **LED count** + **Apply size** (`ResizeZone`) for ARGB controllers that start at 0 LEDs (CM MasterPlus+/ARGB Gen2 A1 V2)  
+3. **Channel/zone picker** + **LED count** + **Apply size** for ARGB controllers that start at 0 LEDs (CM MasterPlus+/ARGB Gen2 A1 V2). Tries `ResizeZone`, then **ConfigureZone** (SDK packet 1003) so CM works without OpenRGB’s Edit Zone  
 4. Color picker → apply solid color to **selected** device/zone or **sync all**  
-5. When applying to a selected zone with `LedCount == 0`, the app **auto-resizes** to the UI LED count (default **24**) then `UpdateZoneLeds`  
+5. When applying to a selected zone with `LedCount == 0`, the app **auto-applies size** to the UI LED count (default **24**) then `UpdateZoneLeds`  
 6. Brightness: client-side RGB scaling (see API quirk below)  
 7. Save / load / delete named profiles as JSON under  
    `%LocalAppData%/UnifiedRgb/profiles/`  
@@ -67,9 +67,11 @@ Out of scope: music sync, effect engines, hardware reverse engineering, installi
 
 ## Cooler Master channel tip
 
+OpenRGB’s UI **does not show Edit Zone** for Cooler Master ARGB Gen2 A1 V2: the driver never sets `ZONE_FLAG_MANUALLY_CONFIGURABLE_SIZE`, so `ResizeZone` is a no-op. This app talks **ConfigureZone** (`NET_PACKET_ID_RGBCONTROLLER_CONFIGUREZONE = 1003`, protocol 6) over a short-lived TCP connection (OpenRGB.NET 3.1.1 only speaks protocol 4 and has no ConfigureZone API). Payload `data_size` is the full packet length, including itself; flags include `ZONE_FLAG_MANUALLY_CONFIGURED_SIZE` (1<<12) and `ZONE_FLAG_MANUALLY_CONFIGURABLE_SIZE` (1<<1). After that, `UpdateZoneLeds` works.
+
 1. Select the CM device in the list.  
 2. Pick the channel/zone that matches the strip (often still `0` LEDs).  
-3. Set **LED count** to **24** (or your strip length) and click **Apply size**, *or* just **Apply to selected** — it will resize automatically when the zone is empty.  
+3. Set **LED count** to **24** (or your strip length) and click **Apply size**, *or* just **Apply to selected** — it will apply size automatically when the zone is empty.  
 4. Lights should update via OpenRGB `UpdateZoneLeds`.
 
 ## Packages
@@ -86,6 +88,7 @@ Out of scope: music sync, effect engines, hardware reverse engineering, installi
 - Prefer `autoConnect: false`, then `Connect()`, so connection failures surface cleanly.
 - Solid color flow: best-effort `SetCustomMode(deviceId)` (or Direct/Custom/Static mode), then `UpdateLeds` / `UpdateZoneLeds`.
 - ARGB hubs: call `ResizeZone(deviceId, zoneId, size)` before LEDs exist; zone exposes `LedsMin` / `LedsMax`.
+- **CM Gen2 / missing Edit Zone:** `ResizeZone` is a no-op without `ZONE_FLAG_MANUALLY_CONFIGURABLE_SIZE`. OpenRGB.NET 3.1.1 max protocol is **4** (`CommandId` has no 1003; `OpenRgbConnection.Send` is internal). This app therefore uses a dedicated raw TCP path that negotiates protocol 6 and sends ConfigureZone; it does **not** inject packets into OpenRGB.NET’s socket (the server would parse Zone Data as protocol 4, dropping flags).
 - **Brightness:** `Mode.SupportsBrightness` / `SetBrightness` exist, but `UpdateMode` **re-fetches** the device and only applies optional `speed` / `direction` / `colors`. There is **no brightness parameter**, so hardware brightness cannot be set through the public API. This app scales RGB client-side instead.
 - Server-side OpenRGB profiles (`SaveProfile` / `LoadProfile`) are separate from this app’s on-disk JSON profiles.
 

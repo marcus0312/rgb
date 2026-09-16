@@ -134,7 +134,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             return;
         }
 
-        // CM Gen2 / ARGB channels often report 0 until ResizeZone — suggest 24 when allowed.
+        // CM Gen2 / ARGB channels often report 0 until ConfigureZone — suggest 24 when allowed.
         if (zone.LedsMax == 0 || zone.LedsMax >= DefaultSuggestedLedCount)
             ZoneLedCount = DefaultSuggestedLedCount;
         else if (zone.LedsMax > 0)
@@ -300,7 +300,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             var size = ZoneLedCount;
             var zoneName = SelectedZone.Name;
             await Task.Run(() => _openRgb.ResizeZone(deviceIndex, zoneIndex, size));
-            StatusText = $"Resized \"{zoneName}\" on {SelectedDevice.Name} to {size} LED(s).";
+            StatusText = $"Applied size {size} LED(s) on \"{zoneName}\" ({SelectedDevice.Name}) via ResizeZone/ConfigureZone.";
             await RefreshDevicesAsync();
         }
         catch (Exception ex)
