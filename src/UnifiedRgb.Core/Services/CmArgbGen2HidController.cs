@@ -25,7 +25,8 @@ public static class CmArgbGen2HidController
 
     private const int PacketLengthWithReportId = 65; // report id 0 + 64 payload
     private const int PacketLengthPayloadOnly = 64;
-    private const int InterPacketDelayMs = 70;
+    /// <summary>Delay between HID packets and between double Static sends for stickiness.</summary>
+    public const int InterPacketDelayMs = 70;
 
     /// <summary>Match OpenRGB device name for Cooler Master ARGB Gen 2 hubs.</summary>
     public static bool IsCoolerMasterArgbGen2(string? deviceName) =>

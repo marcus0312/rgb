@@ -83,7 +83,9 @@ OpenRGB `UpdateMode` / Direct often **ACKs OK** but fans stay on Spectrum/rainbo
 - Prefer HID interface **0 or 1** (skip MI_02 mouse)  
 - Sequence: `LIGHTNING_CONTROL` → `HW_MODE_SETUP` Static with RGB (+ brightness) → optional `APPLY_CHANGES`  
 
-Other devices keep the normal OpenRGB.NET `SetCustomMode` / `UpdateLeds` path. Per-LED Direct (`SetupDirectMode` + channel colors) is future work.
+**Important:** CM Gen2 color is **HID-only** — do **not** follow HID Static with OpenRGB `Direct`/`SetCustomMode`/`UpdateLeds` on this device. Gen2 `SetupDirectMode()` resets the hub and blacks LEDs, which looks like a ~1s flash-then-revert after Apply.
+
+Other devices keep the normal OpenRGB.NET path: enter Direct/Custom (or Static with mode colors via `UpdateMode`), then `UpdateLeds` / `UpdateZoneLeds`. Per-LED Direct channel colors on CM Gen2 remain future work.
 
 ## Packages
 
@@ -98,7 +100,7 @@ Other devices keep the normal OpenRGB.NET `SetCustomMode` / `UpdateLeds` path. P
 
 - Namespace types live in `OpenRGB.NET` (`OpenRgbClient`, `Color`, `Device`, …) — not a separate `Models` namespace in 3.1.1.
 - Prefer `autoConnect: false`, then `Connect()`, so connection failures surface cleanly.
-- Solid color flow: for **Cooler Master ARGB Gen2** on Windows, HID Static (see above); otherwise best-effort `SetCustomMode(deviceId)` (or Direct/Custom/Static mode), then `UpdateLeds` / `UpdateZoneLeds`. Do not rely on OpenRGB mode API alone to leave Spectrum on CM Gen2.
+- Solid color flow: for **Cooler Master ARGB Gen2** on Windows, **HID Static only** (optionally sent twice ~70ms apart) — never OpenRGB Direct afterward. Otherwise: `SetCustomMode` or `UpdateMode(Direct/Custom/Static)` with mode colors when needed, then `UpdateLeds` / `UpdateZoneLeds` (+ short delay). Do not rely on OpenRGB mode API alone to leave Spectrum on CM Gen2.
 - ARGB hubs: call `ResizeZone(deviceId, zoneId, size)` before LEDs exist; zone exposes `LedsMin` / `LedsMax`.
 - **CM Gen2 / missing Edit Zone:** `ResizeZone` is a no-op without `ZONE_FLAG_MANUALLY_CONFIGURABLE_SIZE`. OpenRGB.NET 3.1.1 max protocol is **4** (`CommandId` has no 1003; `OpenRgbConnection.Send` is internal). This app therefore uses a dedicated raw TCP path that negotiates protocol 6 and sends ConfigureZone; it does **not** inject packets into OpenRGB.NET’s socket (the server would parse Zone Data as protocol 4, dropping flags).
 - **Brightness:** `Mode.SupportsBrightness` / `SetBrightness` exist, but `UpdateMode` **re-fetches** the device and only applies optional `speed` / `direction` / `colors`. There is **no brightness parameter**, so hardware brightness cannot be set through the public API. This app scales RGB client-side instead.

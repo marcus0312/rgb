@@ -178,8 +178,8 @@ public sealed class OpenRgbService : IOpenRgbService
 
             LastError = errors.Count > 0 ? string.Join("; ", errors) : null;
             LastStatus = notes.Count > 0
-                ? string.Join(" | ", notes.Distinct())
-                : (ok > 0 ? $"OpenRGB UpdateLeds on {ok} device(s)" : null);
+                ? string.Join(" | ", notes)
+                : (ok > 0 ? $"Applied to {ok} device(s)" : null);
 
             if (errors.Count > 0 && ok > 0)
             {
@@ -397,29 +397,37 @@ public sealed class OpenRgbService : IOpenRgbService
         var deviceLabel = device.Name ?? $"Device {deviceIndex}";
 
         // Cooler Master ARGB Gen2: OpenRGB set_mode/UpdateLeds often leaves Spectrum.
-        // Drive solid color via Windows HID Static (VID 0x2516 PID 0x01C9).
+        // Drive solid color via Windows HID Static only — never follow with OpenRGB Direct
+        // (SetupDirectMode ResetDevice + black LEDs fights HID Static ~1s later).
         if (TryApplyCmGen2HidStatic(device.Name, scaled))
         {
-            // Best-effort: keep OpenRGB SDK/Direct state in sync; do not fail Apply if SDK mode is stuck.
-            TryBestEffortOpenRgbSync(client, deviceIndex, device, scaled);
-            return $"{deviceLabel}: HID Static OK";
+            // Optional second HID Static for stickiness; still no OpenRGB sync.
+            Thread.Sleep(CmArgbGen2HidController.InterPacketDelayMs);
+            _ = TryApplyCmGen2HidStatic(device.Name, scaled);
+            return $"{deviceLabel}: HID Static OK (no OpenRGB follow-up)";
         }
 
+        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
+        var modeNote = EnterWritableMode(client, deviceIndex, device, openRgbColor);
+
+        // Static/mode-specific color was applied via UpdateMode; still push LEDs when present.
         var ledCount = device.Leds.Length;
         if (ledCount == 0)
         {
             System.Diagnostics.Debug.WriteLine(
                 $"[UnifiedRgb] Skip UpdateLeds for '{deviceLabel}': LedCount==0 (resize zone or check OpenRGB).");
-            return $"{deviceLabel}: skipped (LedCount==0)";
+            return string.IsNullOrEmpty(modeNote)
+                ? $"{deviceLabel}: skipped (LedCount==0)"
+                : $"{deviceLabel}: {modeNote}; skipped UpdateLeds (LedCount==0)";
         }
 
-        TryEnterDirectOrCustom(client, deviceIndex, device);
-
-        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
         var colors = new Color[ledCount];
         Array.Fill(colors, openRgbColor);
         client.UpdateLeds(deviceIndex, colors);
-        return $"{deviceLabel}: OpenRGB UpdateLeds";
+        // Slow SMBus/USB devices (ASRock, GPU, mouse) often need a beat before the next controller.
+        Thread.Sleep(PostUpdateLedsDelayMs);
+        var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
+        return $"{deviceLabel}: {modePart} + UpdateLeds({ledCount})";
     }
 
     private static string ApplyToZone(OpenRgbClient client, int deviceIndex, int zoneIndex, RgbColor color, double brightness01)
@@ -431,12 +439,16 @@ public sealed class OpenRgbService : IOpenRgbService
         var scaled = color.WithBrightness(brightness01);
         var deviceLabel = device.Name ?? $"Device {deviceIndex}";
 
-        // Gen2 Static uses CHANNEL_ALL — solid color applies to the whole hub.
+        // Gen2 Static uses CHANNEL_ALL — solid color applies to the whole hub; HID-only.
         if (TryApplyCmGen2HidStatic(device.Name, scaled))
         {
-            TryBestEffortOpenRgbSync(client, deviceIndex, device, scaled);
-            return $"{deviceLabel}: HID Static OK";
+            Thread.Sleep(CmArgbGen2HidController.InterPacketDelayMs);
+            _ = TryApplyCmGen2HidStatic(device.Name, scaled);
+            return $"{deviceLabel}: HID Static OK (no OpenRGB follow-up)";
         }
+
+        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
+        var modeNote = EnterWritableMode(client, deviceIndex, device, openRgbColor);
 
         var zone = device.Zones[zoneIndex];
         var ledCount = (int)zone.LedCount;
@@ -444,48 +456,25 @@ public sealed class OpenRgbService : IOpenRgbService
         {
             System.Diagnostics.Debug.WriteLine(
                 $"[UnifiedRgb] Skip UpdateZoneLeds for '{deviceLabel}' zone {zoneIndex}: LedCount==0.");
-            return $"{deviceLabel} zone {zoneIndex}: skipped (LedCount==0)";
+            return string.IsNullOrEmpty(modeNote)
+                ? $"{deviceLabel} zone {zoneIndex}: skipped (LedCount==0)"
+                : $"{deviceLabel} zone {zoneIndex}: {modeNote}; skipped UpdateZoneLeds (LedCount==0)";
         }
 
-        TryEnterDirectOrCustom(client, deviceIndex, device);
-
-        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
         var colors = new Color[ledCount];
         Array.Fill(colors, openRgbColor);
         client.UpdateZoneLeds(deviceIndex, zoneIndex, colors);
-        return $"{deviceLabel}: OpenRGB UpdateZoneLeds";
-    }
-
-    /// <summary>
-    /// After HID Static succeeds, optionally push Direct/UpdateLeds so SDK UI state matches.
-    /// Never throws — HID already drove the hardware.
-    /// </summary>
-    private static void TryBestEffortOpenRgbSync(
-        OpenRgbClient client, int deviceIndex, Device device, RgbColor scaled)
-    {
-        try
-        {
-            var ledCount = device.Leds.Length;
-            if (ledCount == 0)
-                return;
-
-            TryEnterDirectOrCustom(client, deviceIndex, device);
-            var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
-            var colors = new Color[ledCount];
-            Array.Fill(colors, openRgbColor);
-            client.UpdateLeds(deviceIndex, colors);
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"[UnifiedRgb] Best-effort OpenRGB sync after HID Static failed: {ex.Message}");
-        }
+        Thread.Sleep(PostUpdateLedsDelayMs);
+        var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
+        return $"{deviceLabel} zone {zoneIndex}: {modePart} + UpdateZoneLeds({ledCount})";
     }
 
     /// <summary>
     /// When the OpenRGB device name is Cooler Master ARGB Gen2, send HID Static.
     /// Throws if matching device but HID write fails on Windows (so UI shows the error).
     /// Non-Windows / non-CM devices return false and keep the OpenRGB.NET path.
+    /// Intentionally does NOT call OpenRGB SetCustomMode/UpdateMode/UpdateLeds afterward —
+    /// CM Gen2 SetupDirectMode resets the hub and blacks LEDs, undoing HID Static.
     /// </summary>
     private static bool TryApplyCmGen2HidStatic(string? deviceName, RgbColor scaled)
     {
@@ -502,36 +491,83 @@ public sealed class OpenRgbService : IOpenRgbService
             hidError ?? "Cooler Master ARGB Gen2 HID Static failed.");
     }
 
-    private static void TryEnterDirectOrCustom(OpenRgbClient client, int deviceIndex, Device device)
+    private const int PostUpdateLedsDelayMs = 50;
+
+    /// <summary>
+    /// Enter a writable lighting mode. Prefer Direct/Custom (per-LED). For Static /
+    /// mode-specific color modes, pass the solid color into UpdateMode — UpdateLeds alone
+    /// often does nothing while ASRock/etc. stay in Static without mode colors set.
+    /// Returns a short note for LastStatus, or empty if nothing changed.
+    /// </summary>
+    private static string EnterWritableMode(
+        OpenRgbClient client, int deviceIndex, Device device, Color solidColor)
     {
         try
         {
             client.SetCustomMode(deviceIndex);
-            return;
+            return "SetCustomMode";
         }
         catch
         {
-            // Some devices reject SetCustomMode
+            // Some devices reject SetCustomMode (e.g. Static-only controllers).
         }
 
-        try
+        // Prefer Direct, then Custom, then Static — apply mode colors when required.
+        var preferred = new[] { "Direct", "Custom", "Static" };
+        foreach (var needle in preferred)
         {
             for (var i = 0; i < device.Modes.Length; i++)
             {
-                var name = device.Modes[i].Name ?? "";
-                if (name.Contains("Direct", StringComparison.OrdinalIgnoreCase) ||
-                    name.Contains("Custom", StringComparison.OrdinalIgnoreCase) ||
-                    name.Contains("Static", StringComparison.OrdinalIgnoreCase))
+                var mode = device.Modes[i];
+                var name = mode.Name ?? "";
+                if (!name.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                try
                 {
+                    if (ModeNeedsModeSpecificColors(mode))
+                    {
+                        var modeColors = BuildModeSpecificColors(mode, solidColor);
+                        client.UpdateMode(deviceIndex, i, colors: modeColors);
+                        return $"UpdateMode({name}+colors)";
+                    }
+
                     client.UpdateMode(deviceIndex, i);
-                    return;
+                    return $"UpdateMode({name})";
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[UnifiedRgb] UpdateMode({name}) failed on device {deviceIndex}: {ex.Message}");
                 }
             }
         }
-        catch
-        {
-            // Best-effort
-        }
+
+        return "";
+    }
+
+    private static bool ModeNeedsModeSpecificColors(Mode mode)
+    {
+        if (mode.Flags.HasFlag(ModeFlags.HasModeSpecificColor))
+            return true;
+        return mode.ColorMode == ColorMode.ModeSpecific;
+    }
+
+    private static Color[] BuildModeSpecificColors(Mode mode, Color solid)
+    {
+        var existing = mode.Colors;
+        var count = existing is { Length: > 0 }
+            ? existing.Length
+            : (int)Math.Max(1, mode.ColorMin == 0 && mode.ColorMax == 0 ? 1 : mode.ColorMin);
+        if (mode.ColorMax > 0)
+            count = Math.Min(count, (int)mode.ColorMax);
+        if (mode.ColorMin > 0)
+            count = Math.Max(count, (int)mode.ColorMin);
+        count = Math.Max(1, count);
+
+        var colors = new Color[count];
+        Array.Fill(colors, solid);
+        return colors;
     }
 
     private static DeviceInfo MapDevice(Device d, int index)
