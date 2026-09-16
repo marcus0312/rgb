@@ -404,7 +404,7 @@ public sealed class OpenRgbService : IOpenRgbService
             // Optional second HID Static for stickiness; still no OpenRGB sync.
             Thread.Sleep(CmArgbGen2HidController.InterPacketDelayMs);
             _ = TryApplyCmGen2HidStatic(device.Name, scaled);
-            return $"{deviceLabel}: HID Static OK (no OpenRGB follow-up)";
+            return $"{deviceLabel}: HID Static x2 (no OpenRGB follow-up)";
         }
 
         var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
@@ -444,7 +444,7 @@ public sealed class OpenRgbService : IOpenRgbService
         {
             Thread.Sleep(CmArgbGen2HidController.InterPacketDelayMs);
             _ = TryApplyCmGen2HidStatic(device.Name, scaled);
-            return $"{deviceLabel}: HID Static OK (no OpenRGB follow-up)";
+            return $"{deviceLabel}: HID Static x2 (no OpenRGB follow-up)";
         }
 
         var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
@@ -494,14 +494,20 @@ public sealed class OpenRgbService : IOpenRgbService
     private const int PostUpdateLedsDelayMs = 50;
 
     /// <summary>
-    /// Enter a writable lighting mode. Prefer Direct/Custom (per-LED). For Static /
-    /// mode-specific color modes, pass the solid color into UpdateMode — UpdateLeds alone
-    /// often does nothing while ASRock/etc. stay in Static without mode colors set.
-    /// Returns a short note for LastStatus, or empty if nothing changed.
+    /// Enter a writable lighting mode for Apply-to-selected (one device at a time).
+    /// Order matches hardware needs: Direct (GALAX/G502) → Custom → SetCustomMode →
+    /// Static with mode colors (ASRock). UpdateLeds alone is not enough for Static
+    /// mode-specific controllers. Returns a short note for LastStatus.
     /// </summary>
     private static string EnterWritableMode(
         OpenRgbClient client, int deviceIndex, Device device, Color solidColor)
     {
+        // Named Direct first so GPU/mouse get per-LED Direct, not a vague SetCustomMode.
+        if (TryUpdateNamedMode(client, deviceIndex, device, solidColor, "Direct", out var note))
+            return note;
+        if (TryUpdateNamedMode(client, deviceIndex, device, solidColor, "Custom", out note))
+            return note;
+
         try
         {
             client.SetCustomMode(deviceIndex);
@@ -509,41 +515,53 @@ public sealed class OpenRgbService : IOpenRgbService
         }
         catch
         {
-            // Some devices reject SetCustomMode (e.g. Static-only controllers).
+            // Static-only boards (e.g. some ASRock Polychrome) reject SetCustomMode.
         }
 
-        // Prefer Direct, then Custom, then Static — apply mode colors when required.
-        var preferred = new[] { "Direct", "Custom", "Static" };
-        foreach (var needle in preferred)
+        if (TryUpdateNamedMode(client, deviceIndex, device, solidColor, "Static", out note))
+            return note;
+
+        return "";
+    }
+
+    private static bool TryUpdateNamedMode(
+        OpenRgbClient client,
+        int deviceIndex,
+        Device device,
+        Color solidColor,
+        string needle,
+        out string note)
+    {
+        note = "";
+        for (var i = 0; i < device.Modes.Length; i++)
         {
-            for (var i = 0; i < device.Modes.Length; i++)
+            var mode = device.Modes[i];
+            var name = mode.Name ?? "";
+            if (!name.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try
             {
-                var mode = device.Modes[i];
-                var name = mode.Name ?? "";
-                if (!name.Contains(needle, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                try
+                if (ModeNeedsModeSpecificColors(mode))
                 {
-                    if (ModeNeedsModeSpecificColors(mode))
-                    {
-                        var modeColors = BuildModeSpecificColors(mode, solidColor);
-                        client.UpdateMode(deviceIndex, i, colors: modeColors);
-                        return $"UpdateMode({name}+colors)";
-                    }
+                    var modeColors = BuildModeSpecificColors(mode, solidColor);
+                    client.UpdateMode(deviceIndex, i, colors: modeColors);
+                    note = $"UpdateMode({name}+colors)";
+                    return true;
+                }
 
-                    client.UpdateMode(deviceIndex, i);
-                    return $"UpdateMode({name})";
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[UnifiedRgb] UpdateMode({name}) failed on device {deviceIndex}: {ex.Message}");
-                }
+                client.UpdateMode(deviceIndex, i);
+                note = $"UpdateMode({name})";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[UnifiedRgb] UpdateMode({name}) failed on device {deviceIndex}: {ex.Message}");
             }
         }
 
-        return "";
+        return false;
     }
 
     private static bool ModeNeedsModeSpecificColors(Mode mode)
