@@ -1,0 +1,162 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:UnifiedRgb.App.ViewModels"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="960" d:DesignHeight="640"
+        x:Class="UnifiedRgb.App.Views.MainWindow"
+        x:DataType="vm:MainViewModel"
+        Width="980" Height="680"
+        MinWidth="800" MinHeight="560"
+        WindowStartupLocation="CenterScreen"
+        Title="Unified RGB — OpenRGB Controller">
+
+  <Design.DataContext>
+    <vm:MainViewModel />
+  </Design.DataContext>
+
+  <Window.Styles>
+    <Style Selector="TextBlock.section">
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="FontSize" Value="14" />
+      <Setter Property="Margin" Value="0,0,0,8" />
+    </Style>
+    <Style Selector="Border.card">
+      <Setter Property="Background" Value="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}" />
+      <Setter Property="CornerRadius" Value="8" />
+      <Setter Property="Padding" Value="14" />
+      <Setter Property="Margin" Value="0,0,0,12" />
+    </Style>
+    <Style Selector="Button.spaced">
+      <Setter Property="Margin" Value="0,0,6,0" />
+    </Style>
+  </Window.Styles>
+
+  <DockPanel Margin="16">
+    <Border DockPanel.Dock="Bottom" Padding="10,8" CornerRadius="6" Margin="0,8,0,0"
+            Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}">
+      <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" FontSize="12" Opacity="0.9" />
+    </Border>
+
+    <Grid ColumnDefinitions="*,14,320" RowDefinitions="Auto,12,*">
+
+      <!-- Connection -->
+      <Border Grid.Row="0" Grid.ColumnSpan="3" Classes="card">
+        <StackPanel Spacing="10">
+          <DockPanel>
+            <TextBlock Classes="section" VerticalAlignment="Center" Margin="0"
+                       Text="OpenRGB SDK" DockPanel.Dock="Left" />
+            <Border HorizontalAlignment="Left" CornerRadius="10" Margin="12,0,0,0"
+                    Padding="10,3" Background="{Binding ConnectionBadgeBrush}">
+              <TextBlock Text="{Binding ConnectionBadge}" Foreground="White" FontWeight="SemiBold" FontSize="12" />
+            </Border>
+          </DockPanel>
+
+          <StackPanel Orientation="Horizontal" Spacing="8">
+            <TextBlock VerticalAlignment="Center" Text="Host" />
+            <TextBox Text="{Binding Host}" Watermark="127.0.0.1"
+                     Width="160" IsEnabled="{Binding !IsBusy}" />
+            <TextBlock VerticalAlignment="Center" Text="Port" Margin="8,0,0,0" />
+            <TextBox Text="{Binding PortText}" Watermark="6742"
+                     Width="80" IsEnabled="{Binding !IsBusy}" />
+            <Button Content="Connect" Command="{Binding ConnectCommand}"
+                    IsEnabled="{Binding !IsBusy}" MinWidth="90" Margin="8,0,0,0" />
+            <Button Content="Disconnect" Command="{Binding DisconnectCommand}"
+                    IsEnabled="{Binding IsConnected}" MinWidth="90" />
+            <Button Content="Refresh" Command="{Binding RefreshDevicesCommand}"
+                    IsEnabled="{Binding IsConnected}" MinWidth="80" />
+          </StackPanel>
+        </StackPanel>
+      </Border>
+
+      <!-- Devices -->
+      <Border Grid.Row="2" Grid.Column="0" Classes="card" Margin="0">
+        <DockPanel>
+          <TextBlock DockPanel.Dock="Top" Classes="section" Text="Devices" />
+          <TextBlock DockPanel.Dock="Bottom" Margin="0,8,0,0" FontSize="11" Opacity="0.7"
+                     TextWrapping="Wrap"
+                     Text="Marcus gear: GALAX 2070 Super · CM ARGB Gen2 A1 V2 · ASRock B450 Steel Legend · G502" />
+          <ListBox ItemsSource="{Binding Devices}" SelectedItem="{Binding SelectedDevice}">
+            <ListBox.ItemTemplate>
+              <DataTemplate>
+                <StackPanel Margin="4,6" Spacing="2">
+                  <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                  <TextBlock FontSize="12" Opacity="0.85" Text="{Binding DisplayLine}" />
+                  <TextBlock FontSize="11" Opacity="0.65"
+                             Text="{Binding ZonesSummary, StringFormat=Zones: {0}}" />
+                </StackPanel>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </DockPanel>
+      </Border>
+
+      <!-- Color + Profiles -->
+      <ScrollViewer Grid.Row="2" Grid.Column="2" VerticalScrollBarVisibility="Auto">
+        <StackPanel>
+          <Border Classes="card">
+            <StackPanel Spacing="10">
+              <TextBlock Classes="section" Text="Color" Margin="0" />
+              <Border Height="48" CornerRadius="6" BorderThickness="1"
+                      BorderBrush="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                      Background="{Binding PreviewBrush}" />
+
+              <DockPanel>
+                <TextBlock Text="R" Width="56" VerticalAlignment="Center" />
+                <Slider Minimum="0" Maximum="255" Value="{Binding Red}"
+                        TickFrequency="1" IsSnapToTickEnabled="True" />
+              </DockPanel>
+              <DockPanel>
+                <TextBlock Text="G" Width="56" VerticalAlignment="Center" />
+                <Slider Minimum="0" Maximum="255" Value="{Binding Green}"
+                        TickFrequency="1" IsSnapToTickEnabled="True" />
+              </DockPanel>
+              <DockPanel>
+                <TextBlock Text="B" Width="56" VerticalAlignment="Center" />
+                <Slider Minimum="0" Maximum="255" Value="{Binding Blue}"
+                        TickFrequency="1" IsSnapToTickEnabled="True" />
+              </DockPanel>
+              <DockPanel>
+                <TextBlock Text="Bright %" Width="56" VerticalAlignment="Center" />
+                <Slider Minimum="0" Maximum="100" Value="{Binding Brightness}"
+                        TickFrequency="1" IsSnapToTickEnabled="True" />
+              </DockPanel>
+
+              <DockPanel>
+                <Button DockPanel.Dock="Right" Content="Parse" Margin="8,0,0,0"
+                        Command="{Binding ParseHexCommand}" />
+                <TextBox Text="{Binding ColorHex}" Watermark="#RRGGBB" />
+              </DockPanel>
+
+              <TextBlock FontSize="11" Opacity="0.65" TextWrapping="Wrap"
+                         Text="Brightness scales RGB client-side (OpenRGB.NET has no UpdateMode brightness param)." />
+              <Button Content="Apply to selected" Command="{Binding ApplyToSelectedCommand}"
+                      HorizontalAlignment="Stretch" IsEnabled="{Binding IsConnected}" />
+              <Button Content="Sync all devices" Command="{Binding ApplyToAllCommand}"
+                      HorizontalAlignment="Stretch" IsEnabled="{Binding IsConnected}" />
+            </StackPanel>
+          </Border>
+
+          <Border Classes="card" Margin="0">
+            <StackPanel Spacing="8">
+              <TextBlock Classes="section" Text="Profiles" Margin="0" />
+              <TextBox Text="{Binding ProfileName}" Watermark="Profile name" />
+              <ComboBox ItemsSource="{Binding ProfileNames}"
+                        SelectedItem="{Binding SelectedProfileName}"
+                        HorizontalAlignment="Stretch"
+                        PlaceholderText="Saved profiles…" />
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <Button Content="Save" Command="{Binding SaveProfileCommand}" MinWidth="70" />
+                <Button Content="Load / Apply" Command="{Binding LoadProfileCommand}" MinWidth="100" />
+                <Button Content="Delete" Command="{Binding DeleteProfileCommand}" MinWidth="70" />
+                <Button Content="Refresh list" Command="{Binding RefreshProfilesCommand}" MinWidth="90" />
+              </StackPanel>
+              <TextBlock FontSize="11" Opacity="0.65" TextWrapping="Wrap"
+                         Text="{Binding ProfilesFolder, StringFormat=Stored under: {0}}" />
+            </StackPanel>
+          </Border>
+        </StackPanel>
+      </ScrollViewer>
+    </Grid>
+  </DockPanel>
+</Window>

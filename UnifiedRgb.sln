@@ -1,0 +1,34 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{7F85BC5B-6C9D-4FBB-B811-9FDCB57B0C1E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UnifiedRgb.Core", "src\UnifiedRgb.Core\UnifiedRgb.Core.csproj", "{703B8923-8C54-4065-A4EF-F96C1141F98A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UnifiedRgb.App", "src\UnifiedRgb.App\UnifiedRgb.App.csproj", "{3C0914F6-CC82-4790-ABDC-C16356FF15EE}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{703B8923-8C54-4065-A4EF-F96C1141F98A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{703B8923-8C54-4065-A4EF-F96C1141F98A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{703B8923-8C54-4065-A4EF-F96C1141F98A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{703B8923-8C54-4065-A4EF-F96C1141F98A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3C0914F6-CC82-4790-ABDC-C16356FF15EE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3C0914F6-CC82-4790-ABDC-C16356FF15EE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3C0914F6-CC82-4790-ABDC-C16356FF15EE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3C0914F6-CC82-4790-ABDC-C16356FF15EE}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{703B8923-8C54-4065-A4EF-F96C1141F98A} = {7F85BC5B-6C9D-4FBB-B811-9FDCB57B0C1E}
+		{3C0914F6-CC82-4790-ABDC-C16356FF15EE} = {7F85BC5B-6C9D-4FBB-B811-9FDCB57B0C1E}
+	EndGlobalSection
+EndGlobal
