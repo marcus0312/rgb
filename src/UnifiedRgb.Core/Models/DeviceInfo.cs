@@ -5,7 +5,13 @@ public sealed class ZoneInfo
     public int Index { get; init; }
     public string Name { get; init; } = "";
     public uint LedCount { get; init; }
+    public uint LedsMin { get; init; }
+    public uint LedsMax { get; init; }
     public string Type { get; init; } = "";
+
+    public string DisplayLine =>
+        $"{Name}  ·  {LedCount} LEDs" +
+        (LedsMax > 0 ? $"  (min {LedsMin}–max {LedsMax})" : "");
 }
 
 public sealed class DeviceInfo

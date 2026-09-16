@@ -11,6 +11,7 @@ public sealed class OpenRgbService : IOpenRgbService
 {
     private OpenRgbClient? _client;
     private readonly object _gate = new();
+    private int _timeoutMs = 1500;
 
     public bool IsConnected
     {
@@ -21,6 +22,10 @@ public sealed class OpenRgbService : IOpenRgbService
     }
 
     public string? LastError { get; private set; }
+
+    /// <summary>Brief note from the last successful/partial apply (e.g. "CM Gen2: HID Static OK").</summary>
+    public string? LastStatus { get; private set; }
+
     public string Host { get; private set; } = "127.0.0.1";
     public int Port { get; private set; } = 6742;
 
@@ -33,6 +38,7 @@ public sealed class OpenRgbService : IOpenRgbService
             DisconnectInternal();
             Host = string.IsNullOrWhiteSpace(host) ? "127.0.0.1" : host.Trim();
             Port = port <= 0 ? 6742 : port;
+            _timeoutMs = timeoutMs <= 0 ? 1500 : timeoutMs;
 
             try
             {
@@ -41,7 +47,7 @@ public sealed class OpenRgbService : IOpenRgbService
                     port: Port,
                     name: "UnifiedRgb",
                     autoConnect: false,
-                    timeoutMs: timeoutMs);
+                    timeoutMs: _timeoutMs);
 
                 _client.Connect();
 
@@ -102,11 +108,19 @@ public sealed class OpenRgbService : IOpenRgbService
             EnsureConnected();
             try
             {
-                ApplyToDevice(_client!, deviceIndex, color, brightness01);
+                var note = ApplyToDevice(_client!, deviceIndex, color, brightness01);
                 LastError = null;
+                LastStatus = note;
             }
             catch (Exception ex)
             {
+                LastStatus = null;
+                if (ex is InvalidOperationException && OperatingSystem.IsWindows() &&
+                    ex.Message.Contains("HID", StringComparison.OrdinalIgnoreCase))
+                {
+                    LastError = ex.Message;
+                    throw;
+                }
                 HandleLostConnection(ex);
                 throw;
             }
@@ -118,21 +132,220 @@ public sealed class OpenRgbService : IOpenRgbService
         lock (_gate)
         {
             EnsureConnected();
+
+            int count;
             try
             {
-                var count = _client!.GetControllerCount();
-                for (var i = 0; i < count; i++)
-                    ApplyToDevice(_client, i, color, brightness01);
-
-                LastError = null;
+                count = _client!.GetControllerCount();
             }
             catch (Exception ex)
             {
+                LastStatus = null;
+                HandleLostConnection(ex);
+                throw;
+            }
+
+            var errors = new List<string>();
+            var notes = new List<string>();
+            var ok = 0;
+
+            for (var i = 0; i < count; i++)
+            {
+                try
+                {
+                    var note = ApplyToDevice(_client!, i, color, brightness01);
+                    ok++;
+                    if (!string.IsNullOrWhiteSpace(note))
+                        notes.Add(note);
+                }
+                catch (Exception ex)
+                {
+                    // Continue per-device so one HID/SDK failure does not abort the rest.
+                    string name;
+                    try { name = _client!.GetControllerData(i).Name ?? $"Device {i}"; }
+                    catch { name = $"Device {i}"; }
+                    errors.Add($"{name}: {ex.Message}");
+                }
+            }
+
+            if (ok == 0 && count > 0)
+            {
+                LastError = string.Join("; ", errors);
+                LastStatus = null;
+                throw new InvalidOperationException(
+                    "Failed to apply color to all devices. " + LastError);
+            }
+
+            LastError = errors.Count > 0 ? string.Join("; ", errors) : null;
+            LastStatus = notes.Count > 0
+                ? string.Join(" | ", notes)
+                : (ok > 0 ? $"Applied to {ok} device(s)" : null);
+
+            if (errors.Count > 0 && ok > 0)
+            {
+                // Partial success: keep going; surface combined status for UI.
+                LastStatus = $"{LastStatus}; partial errors: {LastError}";
+            }
+        }
+    }
+
+    public void ApplySolidColorToZone(int deviceIndex, int zoneIndex, RgbColor color, double brightness01 = 1.0)
+    {
+        lock (_gate)
+        {
+            EnsureConnected();
+            try
+            {
+                var note = ApplyToZone(_client!, deviceIndex, zoneIndex, color, brightness01);
+                LastError = null;
+                LastStatus = note;
+            }
+            catch (Exception ex)
+            {
+                LastStatus = null;
+                if (ex is InvalidOperationException &&
+                    ex.Message.Contains("HID", StringComparison.OrdinalIgnoreCase))
+                {
+                    LastError = ex.Message;
+                    throw;
+                }
                 HandleLostConnection(ex);
                 throw;
             }
         }
     }
+
+    public void ResizeZone(int deviceIndex, int zoneIndex, int ledCount)
+    {
+        lock (_gate)
+        {
+            EnsureConnected();
+            Zone zone;
+            try
+            {
+                zone = ValidateZoneSize(deviceIndex, zoneIndex, ledCount);
+
+                // OpenRGB.NET ResizeZone maps to packet 1000. That is a no-op when the
+                // driver did not set ZONE_FLAG_MANUALLY_CONFIGURABLE_SIZE (CM ARGB Gen2).
+                _client!.ResizeZone(deviceIndex, zoneIndex, ledCount);
+
+                var after = _client.GetControllerData(deviceIndex).Zones[zoneIndex];
+                if (after.LedCount == (uint)ledCount)
+                {
+                    LastError = null;
+                    return;
+                }
+            }
+            catch (Exception ex) when (ex is not ArgumentOutOfRangeException)
+            {
+                HandleLostConnection(ex);
+                throw;
+            }
+
+            // Fallback: protocol 6 ConfigureZone (packet 1003) on a dedicated TCP
+            // connection. OpenRGB.NET 3.1.1 max protocol is 4 and has no ConfigureZone;
+            // injecting into its socket would parse Zone Data without flags.
+            try
+            {
+                ConfigureZoneLocked(deviceIndex, zoneIndex, ledCount, zone);
+                LastError = null;
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                throw new InvalidOperationException(ex.Message, ex);
+            }
+        }
+    }
+
+    public void ConfigureZone(int deviceIndex, int zoneIndex, int ledCount)
+    {
+        lock (_gate)
+        {
+            EnsureConnected();
+            Zone zone;
+            try
+            {
+                zone = ValidateZoneSize(deviceIndex, zoneIndex, ledCount);
+            }
+            catch (Exception ex) when (ex is not ArgumentOutOfRangeException)
+            {
+                HandleLostConnection(ex);
+                throw;
+            }
+
+            try
+            {
+                ConfigureZoneLocked(deviceIndex, zoneIndex, ledCount, zone);
+                LastError = null;
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                throw new InvalidOperationException(ex.Message, ex);
+            }
+        }
+    }
+
+    private Zone ValidateZoneSize(int deviceIndex, int zoneIndex, int ledCount)
+    {
+        if (ledCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(ledCount), "LED count must be >= 0.");
+
+        var device = _client!.GetControllerData(deviceIndex);
+        if (zoneIndex < 0 || zoneIndex >= device.Zones.Length)
+            throw new ArgumentOutOfRangeException(nameof(zoneIndex), $"Zone {zoneIndex} is out of range.");
+
+        var zone = device.Zones[zoneIndex];
+        if (zone.LedsMax > 0 && (uint)ledCount > zone.LedsMax)
+            throw new ArgumentOutOfRangeException(nameof(ledCount),
+                $"LED count {ledCount} exceeds zone max {zone.LedsMax}.");
+        if (zone.LedsMin > 0 && (uint)ledCount < zone.LedsMin && ledCount != 0)
+            throw new ArgumentOutOfRangeException(nameof(ledCount),
+                $"LED count {ledCount} is below zone min {zone.LedsMin}.");
+        return zone;
+    }
+
+    private void ConfigureZoneLocked(int deviceIndex, int zoneIndex, int ledCount, Zone zone)
+    {
+        OpenRgbConfigureZoneClient.ConfigureZone(
+            Host,
+            Port,
+            Math.Max(_timeoutMs, 2000),
+            deviceIndex,
+            zoneIndex,
+            new OpenRgbZoneConfig
+            {
+                Name = zone.Name ?? $"Zone {zoneIndex}",
+                Type = MapZoneType(zone.Type),
+                LedsMin = zone.LedsMin,
+                LedsMax = zone.LedsMax > 0 ? zone.LedsMax : 72,
+                LedsCount = (uint)ledCount,
+                Flags = OpenRgbConfigureZoneClient.ZoneFlagManuallyConfigurableSize
+                      | OpenRgbConfigureZoneClient.ZoneFlagManuallyConfiguredSize
+            });
+
+        var verify = _client!.GetControllerData(deviceIndex);
+        if (zoneIndex >= verify.Zones.Length)
+            throw new InvalidOperationException("Zone disappeared after ConfigureZone.");
+
+        var after = verify.Zones[zoneIndex];
+        if (after.LedCount != (uint)ledCount)
+        {
+            throw new InvalidOperationException(
+                $"ConfigureZone did not change LED count (still {after.LedCount}, wanted {ledCount}). " +
+                "OpenRGB 1.0+ SDK is required; OpenRGB GUI also hides Edit Zone for CM Gen2.");
+        }
+    }
+
+    private static int MapZoneType(ZoneType type) =>
+        type switch
+        {
+            ZoneType.Single => 0,
+            ZoneType.Linear => OpenRgbConfigureZoneClient.ZoneTypeLinear,
+            ZoneType.Matrix => 2,
+            _ => OpenRgbConfigureZoneClient.ZoneTypeLinear
+        };
 
     /// <summary>
     /// Hardware brightness via OpenRGB mode flags.
@@ -177,52 +390,184 @@ public sealed class OpenRgbService : IOpenRgbService
         }
     }
 
-    private static void ApplyToDevice(OpenRgbClient client, int deviceIndex, RgbColor color, double brightness01)
+    private static string ApplyToDevice(OpenRgbClient client, int deviceIndex, RgbColor color, double brightness01)
     {
         var device = client.GetControllerData(deviceIndex);
+        var scaled = color.WithBrightness(brightness01);
+        var deviceLabel = device.Name ?? $"Device {deviceIndex}";
+
+        // Cooler Master ARGB Gen2: OpenRGB set_mode/UpdateLeds often leaves Spectrum.
+        // Drive solid color via Windows HID Static only — never follow with OpenRGB Direct
+        // (SetupDirectMode ResetDevice + black LEDs fights HID Static ~1s later).
+        if (TryApplyCmGen2HidStatic(device.Name, scaled))
+        {
+            // Optional second HID Static for stickiness; still no OpenRGB sync.
+            Thread.Sleep(CmArgbGen2HidController.InterPacketDelayMs);
+            _ = TryApplyCmGen2HidStatic(device.Name, scaled);
+            return $"{deviceLabel}: HID Static OK (no OpenRGB follow-up)";
+        }
+
+        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
+        var modeNote = EnterWritableMode(client, deviceIndex, device, openRgbColor);
+
+        // Static/mode-specific color was applied via UpdateMode; still push LEDs when present.
         var ledCount = device.Leds.Length;
         if (ledCount == 0)
-            return;
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[UnifiedRgb] Skip UpdateLeds for '{deviceLabel}': LedCount==0 (resize zone or check OpenRGB).");
+            return string.IsNullOrEmpty(modeNote)
+                ? $"{deviceLabel}: skipped (LedCount==0)"
+                : $"{deviceLabel}: {modeNote}; skipped UpdateLeds (LedCount==0)";
+        }
 
-        TryEnterDirectOrCustom(client, deviceIndex, device);
-
-        var scaled = color.WithBrightness(brightness01);
-        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
         var colors = new Color[ledCount];
         Array.Fill(colors, openRgbColor);
         client.UpdateLeds(deviceIndex, colors);
+        // Slow SMBus/USB devices (ASRock, GPU, mouse) often need a beat before the next controller.
+        Thread.Sleep(PostUpdateLedsDelayMs);
+        var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
+        return $"{deviceLabel}: {modePart} + UpdateLeds({ledCount})";
     }
 
-    private static void TryEnterDirectOrCustom(OpenRgbClient client, int deviceIndex, Device device)
+    private static string ApplyToZone(OpenRgbClient client, int deviceIndex, int zoneIndex, RgbColor color, double brightness01)
+    {
+        var device = client.GetControllerData(deviceIndex);
+        if (zoneIndex < 0 || zoneIndex >= device.Zones.Length)
+            throw new ArgumentOutOfRangeException(nameof(zoneIndex), $"Zone {zoneIndex} is out of range.");
+
+        var scaled = color.WithBrightness(brightness01);
+        var deviceLabel = device.Name ?? $"Device {deviceIndex}";
+
+        // Gen2 Static uses CHANNEL_ALL — solid color applies to the whole hub; HID-only.
+        if (TryApplyCmGen2HidStatic(device.Name, scaled))
+        {
+            Thread.Sleep(CmArgbGen2HidController.InterPacketDelayMs);
+            _ = TryApplyCmGen2HidStatic(device.Name, scaled);
+            return $"{deviceLabel}: HID Static OK (no OpenRGB follow-up)";
+        }
+
+        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
+        var modeNote = EnterWritableMode(client, deviceIndex, device, openRgbColor);
+
+        var zone = device.Zones[zoneIndex];
+        var ledCount = (int)zone.LedCount;
+        if (ledCount == 0)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[UnifiedRgb] Skip UpdateZoneLeds for '{deviceLabel}' zone {zoneIndex}: LedCount==0.");
+            return string.IsNullOrEmpty(modeNote)
+                ? $"{deviceLabel} zone {zoneIndex}: skipped (LedCount==0)"
+                : $"{deviceLabel} zone {zoneIndex}: {modeNote}; skipped UpdateZoneLeds (LedCount==0)";
+        }
+
+        var colors = new Color[ledCount];
+        Array.Fill(colors, openRgbColor);
+        client.UpdateZoneLeds(deviceIndex, zoneIndex, colors);
+        Thread.Sleep(PostUpdateLedsDelayMs);
+        var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
+        return $"{deviceLabel} zone {zoneIndex}: {modePart} + UpdateZoneLeds({ledCount})";
+    }
+
+    /// <summary>
+    /// When the OpenRGB device name is Cooler Master ARGB Gen2, send HID Static.
+    /// Throws if matching device but HID write fails on Windows (so UI shows the error).
+    /// Non-Windows / non-CM devices return false and keep the OpenRGB.NET path.
+    /// Intentionally does NOT call OpenRGB SetCustomMode/UpdateMode/UpdateLeds afterward —
+    /// CM Gen2 SetupDirectMode resets the hub and blacks LEDs, undoing HID Static.
+    /// </summary>
+    private static bool TryApplyCmGen2HidStatic(string? deviceName, RgbColor scaled)
+    {
+        if (!CmArgbGen2HidController.IsCoolerMasterArgbGen2(deviceName))
+            return false;
+
+        if (CmArgbGen2HidController.TrySetStaticColor(scaled.R, scaled.G, scaled.B, out var hidError))
+            return true;
+
+        if (!OperatingSystem.IsWindows())
+            return false;
+
+        throw new InvalidOperationException(
+            hidError ?? "Cooler Master ARGB Gen2 HID Static failed.");
+    }
+
+    private const int PostUpdateLedsDelayMs = 50;
+
+    /// <summary>
+    /// Enter a writable lighting mode. Prefer Direct/Custom (per-LED). For Static /
+    /// mode-specific color modes, pass the solid color into UpdateMode — UpdateLeds alone
+    /// often does nothing while ASRock/etc. stay in Static without mode colors set.
+    /// Returns a short note for LastStatus, or empty if nothing changed.
+    /// </summary>
+    private static string EnterWritableMode(
+        OpenRgbClient client, int deviceIndex, Device device, Color solidColor)
     {
         try
         {
             client.SetCustomMode(deviceIndex);
-            return;
+            return "SetCustomMode";
         }
         catch
         {
-            // Some devices reject SetCustomMode
+            // Some devices reject SetCustomMode (e.g. Static-only controllers).
         }
 
-        try
+        // Prefer Direct, then Custom, then Static — apply mode colors when required.
+        var preferred = new[] { "Direct", "Custom", "Static" };
+        foreach (var needle in preferred)
         {
             for (var i = 0; i < device.Modes.Length; i++)
             {
-                var name = device.Modes[i].Name ?? "";
-                if (name.Contains("Direct", StringComparison.OrdinalIgnoreCase) ||
-                    name.Contains("Custom", StringComparison.OrdinalIgnoreCase) ||
-                    name.Contains("Static", StringComparison.OrdinalIgnoreCase))
+                var mode = device.Modes[i];
+                var name = mode.Name ?? "";
+                if (!name.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                try
                 {
+                    if (ModeNeedsModeSpecificColors(mode))
+                    {
+                        var modeColors = BuildModeSpecificColors(mode, solidColor);
+                        client.UpdateMode(deviceIndex, i, colors: modeColors);
+                        return $"UpdateMode({name}+colors)";
+                    }
+
                     client.UpdateMode(deviceIndex, i);
-                    return;
+                    return $"UpdateMode({name})";
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[UnifiedRgb] UpdateMode({name}) failed on device {deviceIndex}: {ex.Message}");
                 }
             }
         }
-        catch
-        {
-            // Best-effort
-        }
+
+        return "";
+    }
+
+    private static bool ModeNeedsModeSpecificColors(Mode mode)
+    {
+        if (mode.Flags.HasFlag(ModeFlags.HasModeSpecificColor))
+            return true;
+        return mode.ColorMode == ColorMode.ModeSpecific;
+    }
+
+    private static Color[] BuildModeSpecificColors(Mode mode, Color solid)
+    {
+        var existing = mode.Colors;
+        var count = existing is { Length: > 0 }
+            ? existing.Length
+            : (int)Math.Max(1, mode.ColorMin == 0 && mode.ColorMax == 0 ? 1 : mode.ColorMin);
+        if (mode.ColorMax > 0)
+            count = Math.Min(count, (int)mode.ColorMax);
+        if (mode.ColorMin > 0)
+            count = Math.Max(count, (int)mode.ColorMin);
+        count = Math.Max(1, count);
+
+        var colors = new Color[count];
+        Array.Fill(colors, solid);
+        return colors;
     }
 
     private static DeviceInfo MapDevice(Device d, int index)
@@ -254,6 +599,8 @@ public sealed class OpenRgbService : IOpenRgbService
                 Index = z.Index,
                 Name = z.Name ?? $"Zone {z.Index}",
                 LedCount = z.LedCount,
+                LedsMin = z.LedsMin,
+                LedsMax = z.LedsMax,
                 Type = z.Type.ToString()
             }).ToList()
         };
