@@ -61,7 +61,7 @@ New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
 
 # Stop a running instance if present (best-effort)
 Get-Process -Name "UnifiedRgb.App" -ErrorAction SilentlyContinue | ForEach-Object {
-    Write-Host "Stopping running UnifiedRgb.App (PID $($_.Id))…"
+    Write-Host "Stopping running UnifiedRgb.App (PID $($_.Id))..."
     $_ | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
@@ -69,7 +69,7 @@ Copy-Item -Path (Join-Path $src "*") -Destination $InstallRoot -Recurse -Force
 
 $exePath = Join-Path $InstallRoot $ExeName
 if (-not (Test-Path $exePath)) {
-    throw "Install copy failed — $exePath missing."
+    throw "Install copy failed - $exePath missing."
 }
 
 # Marker so the app defaults Start with Windows ON
@@ -132,4 +132,4 @@ Set-ItemProperty -Path $UninstallKey -Name "NoRepair" -Value 1 -Type DWord
 Write-Host ""
 Write-Host "Installed. Launch from Start Menu: $DisplayName"
 Write-Host "Settings / profiles: $env:LOCALAPPDATA\UnifiedRgb\"
-Write-Host "Uninstall: $uninstallScript  (or Apps & Features → Unified RGB)"
+Write-Host "Uninstall: $uninstallScript  (or Apps & Features -> Unified RGB)"
