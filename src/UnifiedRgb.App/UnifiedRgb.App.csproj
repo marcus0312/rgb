@@ -7,6 +7,10 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
     <ApplicationIcon>Assets/avalonia-logo.ico</ApplicationIcon>
+    <AssemblyName>UnifiedRgb.App</AssemblyName>
+    <Product>Unified RGB</Product>
+    <AssemblyTitle>Unified RGB</AssemblyTitle>
+    <RootNamespace>UnifiedRgb.App</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
