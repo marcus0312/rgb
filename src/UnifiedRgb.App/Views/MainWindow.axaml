@@ -6,7 +6,7 @@
         mc:Ignorable="d" d:DesignWidth="960" d:DesignHeight="640"
         x:Class="UnifiedRgb.App.Views.MainWindow"
         x:DataType="vm:MainViewModel"
-        Width="980" Height="680"
+        Width="980" Height="720"
         MinWidth="800" MinHeight="560"
         WindowStartupLocation="CenterScreen"
         Title="Unified RGB — OpenRGB Controller">
@@ -91,9 +91,37 @@
         </DockPanel>
       </Border>
 
-      <!-- Color + Profiles -->
+      <!-- Color + Channel + Profiles -->
       <ScrollViewer Grid.Row="2" Grid.Column="2" VerticalScrollBarVisibility="Auto">
         <StackPanel>
+          <Border Classes="card">
+            <StackPanel Spacing="10">
+              <TextBlock Classes="section" Text="Channel / Zone" Margin="0" />
+              <ComboBox ItemsSource="{Binding Zones}"
+                        SelectedItem="{Binding SelectedZone}"
+                        HorizontalAlignment="Stretch"
+                        PlaceholderText="Select channel…">
+                <ComboBox.ItemTemplate>
+                  <DataTemplate>
+                    <TextBlock Text="{Binding DisplayLine}" />
+                  </DataTemplate>
+                </ComboBox.ItemTemplate>
+              </ComboBox>
+              <DockPanel>
+                <TextBlock Text="LED count" Width="72" VerticalAlignment="Center" />
+                <NumericUpDown Value="{Binding ZoneLedCount}"
+                               Minimum="0" Maximum="512"
+                               Increment="1" FormatString="0"
+                               HorizontalAlignment="Stretch"
+                               IsEnabled="{Binding IsConnected}" />
+              </DockPanel>
+              <TextBlock FontSize="11" Opacity="0.65" TextWrapping="Wrap"
+                         Text="{Binding ZoneLimitsHint}" />
+              <Button Content="Apply size (ResizeZone)" Command="{Binding ApplyResizeCommand}"
+                      HorizontalAlignment="Stretch" IsEnabled="{Binding IsConnected}" />
+            </StackPanel>
+          </Border>
+
           <Border Classes="card">
             <StackPanel Spacing="10">
               <TextBlock Classes="section" Text="Color" Margin="0" />
@@ -129,7 +157,7 @@
               </DockPanel>
 
               <TextBlock FontSize="11" Opacity="0.65" TextWrapping="Wrap"
-                         Text="Brightness scales RGB client-side (OpenRGB.NET has no UpdateMode brightness param)." />
+                         Text="Apply uses the selected channel when set. If LED count is 0, it auto-resizes to the LED count above (default 24) then UpdateZoneLeds." />
               <Button Content="Apply to selected" Command="{Binding ApplyToSelectedCommand}"
                       HorizontalAlignment="Stretch" IsEnabled="{Binding IsConnected}" />
               <Button Content="Sync all devices" Command="{Binding ApplyToAllCommand}"

@@ -16,5 +16,7 @@ public interface IOpenRgbService : IDisposable
     IReadOnlyList<DeviceInfo> ListDevices();
     void ApplySolidColor(int deviceIndex, RgbColor color, double brightness01 = 1.0);
     void ApplySolidColorToAll(RgbColor color, double brightness01 = 1.0);
+    void ApplySolidColorToZone(int deviceIndex, int zoneIndex, RgbColor color, double brightness01 = 1.0);
+    void ResizeZone(int deviceIndex, int zoneIndex, int ledCount);
     bool TrySetHardwareBrightness(int deviceIndex, uint brightness, out string? error);
 }

@@ -13,8 +13,11 @@ namespace UnifiedRgb.App.ViewModels;
 
 public partial class MainViewModel : ViewModelBase, IDisposable
 {
+    private const int DefaultSuggestedLedCount = 24;
+
     private readonly OpenRgbService _openRgb = new();
     private readonly ProfileStore _profiles = new();
+    private bool _suppressZoneLedSync;
 
     [ObservableProperty] private string _host = "127.0.0.1";
     [ObservableProperty] private string _portText = "6742";
@@ -22,6 +25,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private string _statusText = "Disconnected — start OpenRGB SDK Server (default port 6742).";
     [ObservableProperty] private bool _isBusy;
     [ObservableProperty] private DeviceInfo? _selectedDevice;
+    [ObservableProperty] private ZoneInfo? _selectedZone;
+    [ObservableProperty] private int _zoneLedCount = DefaultSuggestedLedCount;
     [ObservableProperty] private int _red = 255;
     [ObservableProperty] private int _green;
     [ObservableProperty] private int _blue;
@@ -31,6 +36,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private string _colorHex = "#FF0000";
 
     public ObservableCollection<DeviceInfo> Devices { get; } = new();
+    public ObservableCollection<ZoneInfo> Zones { get; } = new();
     public ObservableCollection<string> ProfileNames { get; } = new();
 
     public IBrush PreviewBrush => new SolidColorBrush(Color.FromRgb((byte)Red, (byte)Green, (byte)Blue));
@@ -42,6 +48,18 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             : new SolidColorBrush(Color.FromRgb(180, 60, 60));
 
     public string ProfilesFolder => _profiles.DirectoryPath;
+
+    public string ZoneLimitsHint
+    {
+        get
+        {
+            if (SelectedZone is null)
+                return "Select a channel/zone to resize ARGB strips (e.g. CM Gen2 A1 V2).";
+            var z = SelectedZone;
+            return $"Current {z.LedCount} LEDs · min {z.LedsMin} · max {z.LedsMax}" +
+                   (z.LedCount == 0 ? " — resize before lights will work." : "");
+        }
+    }
 
     public MainViewModel()
     {
@@ -58,10 +76,71 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         OnPropertyChanged(nameof(ConnectionBadgeBrush));
     }
 
+    partial void OnSelectedDeviceChanged(DeviceInfo? value)
+    {
+        PopulateZonesFromDevice(value);
+    }
+
+    partial void OnSelectedZoneChanged(ZoneInfo? value)
+    {
+        SyncZoneLedCountFromSelection(value);
+        OnPropertyChanged(nameof(ZoneLimitsHint));
+    }
+
     private void NotifyColorChanged()
     {
         ColorHex = $"#{(byte)Red:X2}{(byte)Green:X2}{(byte)Blue:X2}";
         OnPropertyChanged(nameof(PreviewBrush));
+    }
+
+    private void PopulateZonesFromDevice(DeviceInfo? device)
+    {
+        var previousZoneIndex = SelectedZone?.Index;
+        Zones.Clear();
+
+        if (device?.Zones is { Count: > 0 })
+        {
+            foreach (var z in device.Zones)
+                Zones.Add(z);
+
+            SelectedZone = previousZoneIndex is int idx
+                ? Zones.FirstOrDefault(z => z.Index == idx) ?? Zones[0]
+                : Zones[0];
+        }
+        else
+        {
+            SelectedZone = null;
+            if (!_suppressZoneLedSync)
+                ZoneLedCount = DefaultSuggestedLedCount;
+        }
+
+        OnPropertyChanged(nameof(ZoneLimitsHint));
+    }
+
+    private void SyncZoneLedCountFromSelection(ZoneInfo? zone)
+    {
+        if (_suppressZoneLedSync)
+            return;
+
+        if (zone is null)
+        {
+            ZoneLedCount = DefaultSuggestedLedCount;
+            return;
+        }
+
+        if (zone.LedCount > 0)
+        {
+            ZoneLedCount = (int)zone.LedCount;
+            return;
+        }
+
+        // CM Gen2 / ARGB channels often report 0 until ResizeZone — suggest 24 when allowed.
+        if (zone.LedsMax == 0 || zone.LedsMax >= DefaultSuggestedLedCount)
+            ZoneLedCount = DefaultSuggestedLedCount;
+        else if (zone.LedsMax > 0)
+            ZoneLedCount = (int)zone.LedsMax;
+        else
+            ZoneLedCount = DefaultSuggestedLedCount;
     }
 
     private void OnConnectionChanged(object? sender, EventArgs e)
@@ -72,7 +151,9 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             if (!IsConnected)
             {
                 Devices.Clear();
+                Zones.Clear();
                 SelectedDevice = null;
+                SelectedZone = null;
                 if (!string.IsNullOrWhiteSpace(_openRgb.LastError))
                     StatusText = _openRgb.LastError;
                 else
@@ -104,6 +185,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             IsConnected = false;
             StatusText = ex.Message;
             Devices.Clear();
+            Zones.Clear();
         }
         finally
         {
@@ -117,7 +199,9 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         _openRgb.Disconnect();
         IsConnected = false;
         Devices.Clear();
+        Zones.Clear();
         SelectedDevice = null;
+        SelectedZone = null;
         StatusText = "Disconnected.";
     }
 
@@ -133,13 +217,39 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         IsBusy = true;
         try
         {
+            var previousDeviceIndex = SelectedDevice?.Index;
+            var previousZoneIndex = SelectedZone?.Index;
+            var previousLedCount = ZoneLedCount;
+
             var list = await Task.Run(() => _openRgb.ListDevices());
             Devices.Clear();
             foreach (var d in list)
                 Devices.Add(d);
 
-            if (SelectedDevice is not null)
-                SelectedDevice = Devices.FirstOrDefault(d => d.Index == SelectedDevice.Index);
+            _suppressZoneLedSync = true;
+            try
+            {
+                if (previousDeviceIndex is int di)
+                    SelectedDevice = Devices.FirstOrDefault(d => d.Index == di);
+                else
+                    SelectedDevice = Devices.FirstOrDefault();
+
+                if (SelectedDevice is not null && previousZoneIndex is int zi)
+                {
+                    var match = Zones.FirstOrDefault(z => z.Index == zi);
+                    if (match is not null)
+                        SelectedZone = match;
+                }
+
+                // Keep the user's typed LED count across refresh/resize.
+                ZoneLedCount = previousLedCount;
+            }
+            finally
+            {
+                _suppressZoneLedSync = false;
+            }
+
+            OnPropertyChanged(nameof(ZoneLimitsHint));
 
             StatusText = Devices.Count == 0
                 ? "Connected — no devices detected. Check OpenRGB device list / PawnIO / close vendor RGB apps."
@@ -150,7 +260,53 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             IsConnected = _openRgb.IsConnected;
             StatusText = ex.Message;
             if (!IsConnected)
+            {
                 Devices.Clear();
+                Zones.Clear();
+            }
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    [RelayCommand]
+    private async Task ApplyResizeAsync()
+    {
+        if (SelectedDevice is null)
+        {
+            StatusText = "Select a device first.";
+            return;
+        }
+
+        if (SelectedZone is null)
+        {
+            StatusText = "Select a channel/zone first.";
+            return;
+        }
+
+        if (ZoneLedCount < 0)
+        {
+            StatusText = "LED count must be >= 0.";
+            return;
+        }
+
+        IsBusy = true;
+        try
+        {
+            var deviceIndex = SelectedDevice.Index;
+            var zoneIndex = SelectedZone.Index;
+            var size = ZoneLedCount;
+            var zoneName = SelectedZone.Name;
+            await Task.Run(() => _openRgb.ResizeZone(deviceIndex, zoneIndex, size));
+            StatusText = $"Resized \"{zoneName}\" on {SelectedDevice.Name} to {size} LED(s).";
+            await RefreshDevicesAsync();
+        }
+        catch (Exception ex)
+        {
+            StatusText = ex.Message;
+            IsConnected = _openRgb.IsConnected;
         }
         finally
         {
@@ -172,9 +328,34 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         {
             var color = CurrentColor();
             var bright = Brightness / 100.0;
-            var index = SelectedDevice.Index;
-            await Task.Run(() => _openRgb.ApplySolidColor(index, color, bright));
-            StatusText = $"Applied {color.ToHex()} @ {Brightness:0}% to {SelectedDevice.Name}.";
+            var deviceIndex = SelectedDevice.Index;
+            var deviceName = SelectedDevice.Name;
+
+            if (SelectedZone is not null)
+            {
+                var zoneIndex = SelectedZone.Index;
+                var zoneName = SelectedZone.Name;
+                var ledCount = SelectedZone.LedCount;
+                var desiredSize = ZoneLedCount > 0 ? ZoneLedCount : DefaultSuggestedLedCount;
+
+                await Task.Run(() =>
+                {
+                    if (ledCount == 0)
+                        _openRgb.ResizeZone(deviceIndex, zoneIndex, desiredSize);
+
+                    _openRgb.ApplySolidColorToZone(deviceIndex, zoneIndex, color, bright);
+                });
+
+                StatusText = ledCount == 0
+                    ? $"Resized \"{zoneName}\" to {desiredSize} then applied {color.ToHex()} @ {Brightness:0}%."
+                    : $"Applied {color.ToHex()} @ {Brightness:0}% to zone \"{zoneName}\" on {deviceName}.";
+            }
+            else
+            {
+                await Task.Run(() => _openRgb.ApplySolidColor(deviceIndex, color, bright));
+                StatusText = $"Applied {color.ToHex()} @ {Brightness:0}% to {deviceName}.";
+            }
+
             await RefreshDevicesAsync();
         }
         catch (Exception ex)

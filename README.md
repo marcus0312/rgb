@@ -19,7 +19,7 @@ This client does **not** install OpenRGB and does **not** require Administrator 
 | Gear | Notes |
 |------|--------|
 | GALAX RTX 2070 Super | GPU SMBus RGB via OpenRGB Galax detector; needs PawnIO |
-| Cooler Master ARGB Gen2 A1 V2 | USB HID; quit MasterPlus+ first |
+| Cooler Master ARGB Gen2 A1 V2 | USB HID; quit MasterPlus+ first. Channels often report **0 LEDs** until you **ResizeZone** (typically **24**). |
 | ASRock B450 Steel Legend | Polychrome (SMBus or USB depending on board revision) |
 | Logitech G502 | Often detected as a mouse device in OpenRGB |
 
@@ -55,13 +55,22 @@ On Windows, start OpenRGB → **SDK Server** → **Start Server**, then click **
 
 1. Connect to OpenRGB SDK  
 2. List devices (name, zones, LED counts, mode)  
-3. Color picker → apply solid color to **selected** device or **sync all**  
-4. Brightness: client-side RGB scaling (see API quirk below)  
-5. Save / load / delete named profiles as JSON under  
+3. **Channel/zone picker** + **LED count** + **Apply size** (`ResizeZone`) for ARGB controllers that start at 0 LEDs (CM MasterPlus+/ARGB Gen2 A1 V2)  
+4. Color picker → apply solid color to **selected** device/zone or **sync all**  
+5. When applying to a selected zone with `LedCount == 0`, the app **auto-resizes** to the UI LED count (default **24**) then `UpdateZoneLeds`  
+6. Brightness: client-side RGB scaling (see API quirk below)  
+7. Save / load / delete named profiles as JSON under  
    `%LocalAppData%/UnifiedRgb/profiles/`  
-6. Clear connection status / errors when the server is unavailable  
+8. Clear connection status / errors when the server is unavailable  
 
 Out of scope: music sync, effect engines, hardware reverse engineering, installing OpenRGB.
+
+## Cooler Master channel tip
+
+1. Select the CM device in the list.  
+2. Pick the channel/zone that matches the strip (often still `0` LEDs).  
+3. Set **LED count** to **24** (or your strip length) and click **Apply size**, *or* just **Apply to selected** — it will resize automatically when the zone is empty.  
+4. Lights should update via OpenRGB `UpdateZoneLeds`.
 
 ## Packages
 
@@ -75,7 +84,8 @@ Out of scope: music sync, effect engines, hardware reverse engineering, installi
 
 - Namespace types live in `OpenRGB.NET` (`OpenRgbClient`, `Color`, `Device`, …) — not a separate `Models` namespace in 3.1.1.
 - Prefer `autoConnect: false`, then `Connect()`, so connection failures surface cleanly.
-- Solid color flow: best-effort `SetCustomMode(deviceId)` (or Direct/Custom/Static mode), then `UpdateLeds(deviceId, colors)`.
+- Solid color flow: best-effort `SetCustomMode(deviceId)` (or Direct/Custom/Static mode), then `UpdateLeds` / `UpdateZoneLeds`.
+- ARGB hubs: call `ResizeZone(deviceId, zoneId, size)` before LEDs exist; zone exposes `LedsMin` / `LedsMax`.
 - **Brightness:** `Mode.SupportsBrightness` / `SetBrightness` exist, but `UpdateMode` **re-fetches** the device and only applies optional `speed` / `direction` / `colors`. There is **no brightness parameter**, so hardware brightness cannot be set through the public API. This app scales RGB client-side instead.
 - Server-side OpenRGB profiles (`SaveProfile` / `LoadProfile`) are separate from this app’s on-disk JSON profiles.
 

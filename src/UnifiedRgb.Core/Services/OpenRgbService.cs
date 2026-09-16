@@ -134,6 +134,57 @@ public sealed class OpenRgbService : IOpenRgbService
         }
     }
 
+    public void ApplySolidColorToZone(int deviceIndex, int zoneIndex, RgbColor color, double brightness01 = 1.0)
+    {
+        lock (_gate)
+        {
+            EnsureConnected();
+            try
+            {
+                ApplyToZone(_client!, deviceIndex, zoneIndex, color, brightness01);
+                LastError = null;
+            }
+            catch (Exception ex)
+            {
+                HandleLostConnection(ex);
+                throw;
+            }
+        }
+    }
+
+    public void ResizeZone(int deviceIndex, int zoneIndex, int ledCount)
+    {
+        lock (_gate)
+        {
+            EnsureConnected();
+            try
+            {
+                if (ledCount < 0)
+                    throw new ArgumentOutOfRangeException(nameof(ledCount), "LED count must be >= 0.");
+
+                var device = _client!.GetControllerData(deviceIndex);
+                if (zoneIndex < 0 || zoneIndex >= device.Zones.Length)
+                    throw new ArgumentOutOfRangeException(nameof(zoneIndex), $"Zone {zoneIndex} is out of range.");
+
+                var zone = device.Zones[zoneIndex];
+                if (zone.LedsMax > 0 && (uint)ledCount > zone.LedsMax)
+                    throw new ArgumentOutOfRangeException(nameof(ledCount),
+                        $"LED count {ledCount} exceeds zone max {zone.LedsMax}.");
+                if (zone.LedsMin > 0 && (uint)ledCount < zone.LedsMin && ledCount != 0)
+                    throw new ArgumentOutOfRangeException(nameof(ledCount),
+                        $"LED count {ledCount} is below zone min {zone.LedsMin}.");
+
+                _client.ResizeZone(deviceIndex, zoneIndex, ledCount);
+                LastError = null;
+            }
+            catch (Exception ex) when (ex is not ArgumentOutOfRangeException)
+            {
+                HandleLostConnection(ex);
+                throw;
+            }
+        }
+    }
+
     /// <summary>
     /// Hardware brightness via OpenRGB mode flags.
     /// OpenRGB.NET 3.1.1 exposes Mode.SupportsBrightness / SetBrightness, but UpdateMode
@@ -191,6 +242,26 @@ public sealed class OpenRgbService : IOpenRgbService
         var colors = new Color[ledCount];
         Array.Fill(colors, openRgbColor);
         client.UpdateLeds(deviceIndex, colors);
+    }
+
+    private static void ApplyToZone(OpenRgbClient client, int deviceIndex, int zoneIndex, RgbColor color, double brightness01)
+    {
+        var device = client.GetControllerData(deviceIndex);
+        if (zoneIndex < 0 || zoneIndex >= device.Zones.Length)
+            throw new ArgumentOutOfRangeException(nameof(zoneIndex), $"Zone {zoneIndex} is out of range.");
+
+        var zone = device.Zones[zoneIndex];
+        var ledCount = (int)zone.LedCount;
+        if (ledCount == 0)
+            return;
+
+        TryEnterDirectOrCustom(client, deviceIndex, device);
+
+        var scaled = color.WithBrightness(brightness01);
+        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
+        var colors = new Color[ledCount];
+        Array.Fill(colors, openRgbColor);
+        client.UpdateZoneLeds(deviceIndex, zoneIndex, colors);
     }
 
     private static void TryEnterDirectOrCustom(OpenRgbClient client, int deviceIndex, Device device)
@@ -254,6 +325,8 @@ public sealed class OpenRgbService : IOpenRgbService
                 Index = z.Index,
                 Name = z.Name ?? $"Zone {z.Index}",
                 LedCount = z.LedCount,
+                LedsMin = z.LedsMin,
+                LedsMax = z.LedsMax,
                 Type = z.Type.ToString()
             }).ToList()
         };
