@@ -6,6 +6,7 @@ public interface IOpenRgbService : IDisposable
 {
     bool IsConnected { get; }
     string? LastError { get; }
+    string? LastStatus { get; }
     string Host { get; }
     int Port { get; }
 

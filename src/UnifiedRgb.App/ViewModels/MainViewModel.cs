@@ -346,14 +346,14 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                     _openRgb.ApplySolidColorToZone(deviceIndex, zoneIndex, color, bright);
                 });
 
-                StatusText = ledCount == 0
+                StatusText = AppendLastStatus(ledCount == 0
                     ? $"Resized \"{zoneName}\" to {desiredSize} then applied {color.ToHex()} @ {Brightness:0}%."
-                    : $"Applied {color.ToHex()} @ {Brightness:0}% to zone \"{zoneName}\" on {deviceName}.";
+                    : $"Applied {color.ToHex()} @ {Brightness:0}% to zone \"{zoneName}\" on {deviceName}.");
             }
             else
             {
                 await Task.Run(() => _openRgb.ApplySolidColor(deviceIndex, color, bright));
-                StatusText = $"Applied {color.ToHex()} @ {Brightness:0}% to {deviceName}.";
+                StatusText = AppendLastStatus($"Applied {color.ToHex()} @ {Brightness:0}% to {deviceName}.");
             }
 
             await RefreshDevicesAsync();
@@ -384,7 +384,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             var color = CurrentColor();
             var bright = Brightness / 100.0;
             await Task.Run(() => _openRgb.ApplySolidColorToAll(color, bright));
-            StatusText = $"Synced {color.ToHex()} @ {Brightness:0}% to all devices.";
+            StatusText = AppendLastStatus($"Synced {color.ToHex()} @ {Brightness:0}% to all devices.");
             await RefreshDevicesAsync();
         }
         catch (Exception ex)
@@ -556,6 +556,12 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         ProfileNames.Clear();
         foreach (var n in _profiles.ListProfiles())
             ProfileNames.Add(n);
+    }
+
+    private string AppendLastStatus(string baseStatus)
+    {
+        var note = _openRgb.LastStatus;
+        return string.IsNullOrWhiteSpace(note) ? baseStatus : $"{baseStatus} ({note})";
     }
 
     private RgbColor CurrentColor() => new((byte)Red, (byte)Green, (byte)Blue);

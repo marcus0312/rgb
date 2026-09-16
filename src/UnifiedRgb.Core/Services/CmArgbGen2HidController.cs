@@ -23,7 +23,8 @@ public static class CmArgbGen2HidController
     private const byte DefaultSpeed = 0x02;
     private const byte FullBrightness = 0xFF;
 
-    private const int PacketLength = 65;
+    private const int PacketLengthWithReportId = 65; // report id 0 + 64 payload
+    private const int PacketLengthPayloadOnly = 64;
     private const int InterPacketDelayMs = 70;
 
     /// <summary>Match OpenRGB device name for Cooler Master ARGB Gen 2 hubs.</summary>
@@ -32,8 +33,8 @@ public static class CmArgbGen2HidController
         deviceName.Contains("Cooler Master ARGB", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Send HID Static solid color on Windows. Prefers interface 0 or 1 (skips MI_02 mouse).
-    /// Returns false when not Windows, device missing, or all interfaces fail to write.
+    /// Send HID Static solid color on Windows. Writes to all preferred interfaces
+    /// (MI_01 then MI_00; skips MI_02 mouse). Succeeds if any interface accepts the write.
     /// </summary>
     public static bool TrySetStaticColor(byte r, byte g, byte b, out string? error) =>
         TrySetStaticColor(r, g, b, FullBrightness, apply: true, out error);
@@ -62,31 +63,28 @@ public static class CmArgbGen2HidController
                 return false;
             }
 
+            var anySuccess = false;
             Exception? lastWriteError = null;
+            var openFailures = 0;
+
+            // Write to every preferred interface. MI_00 may accept writes without driving LEDs;
+            // MI_01 is tried first and both are always attempted when present.
             foreach (var device in candidates)
             {
                 try
                 {
                     if (!device.TryOpen(out var stream))
+                    {
+                        openFailures++;
                         continue;
+                    }
 
                     using (stream)
                     {
-                        WritePacket(stream, BuildLightningControl());
-                        Thread.Sleep(InterPacketDelayMs);
-
-                        WritePacket(stream, BuildHwModeSetupStatic(r, g, b, brightness));
-                        Thread.Sleep(InterPacketDelayMs);
-
-                        if (apply)
-                        {
-                            WritePacket(stream, BuildApplyChanges());
-                            Thread.Sleep(InterPacketDelayMs);
-                        }
+                        WriteStaticSequence(stream, device, r, g, b, brightness, apply);
                     }
 
-                    error = null;
-                    return true;
+                    anySuccess = true;
                 }
                 catch (Exception ex)
                 {
@@ -94,9 +92,17 @@ public static class CmArgbGen2HidController
                 }
             }
 
+            if (anySuccess)
+            {
+                error = null;
+                return true;
+            }
+
             error = lastWriteError is null
-                ? "Could not open any Cooler Master ARGB Gen2 HID interface for write."
-                : $"HID write failed: {lastWriteError.Message}";
+                ? openFailures > 0
+                    ? "Could not open any Cooler Master ARGB Gen2 HID interface for write."
+                    : "Could not write to any Cooler Master ARGB Gen2 HID interface."
+                : $"HID write failed on all interfaces: {lastWriteError.Message}";
             return false;
         }
         catch (Exception ex)
@@ -104,6 +110,81 @@ public static class CmArgbGen2HidController
             error = $"HID enumeration failed: {ex.Message}";
             return false;
         }
+    }
+
+    private static void WriteStaticSequence(
+        HidStream stream,
+        HidDevice device,
+        byte r,
+        byte g,
+        byte b,
+        byte brightness,
+        bool apply)
+    {
+        WritePacketFlexible(stream, device, BuildLightningControl);
+        Thread.Sleep(InterPacketDelayMs);
+
+        WritePacketFlexible(stream, device, len => BuildHwModeSetupStatic(len, r, g, b, brightness));
+        Thread.Sleep(InterPacketDelayMs);
+
+        if (apply)
+        {
+            WritePacketFlexible(stream, device, BuildApplyChanges);
+            Thread.Sleep(InterPacketDelayMs);
+        }
+    }
+
+    /// <summary>
+    /// Prefer 65-byte (report id 0 + 64) when the stack allows it; if max output is 64,
+    /// try 64-byte payload-only. On write failure with the first size, retry the other.
+    /// </summary>
+    private static void WritePacketFlexible(
+        HidStream stream,
+        HidDevice device,
+        Func<int, byte[]> buildPacket)
+    {
+        var lengths = ResolvePacketLengths(device);
+        Exception? last = null;
+
+        foreach (var len in lengths)
+        {
+            try
+            {
+                var packet = buildPacket(len);
+                stream.Write(packet);
+                stream.Flush();
+                return;
+            }
+            catch (Exception ex)
+            {
+                last = ex;
+            }
+        }
+
+        throw last ?? new InvalidOperationException("HID write failed for all packet lengths.");
+    }
+
+    private static int[] ResolvePacketLengths(HidDevice device)
+    {
+        int maxOut;
+        try
+        {
+            maxOut = device.GetMaxOutputReportLength();
+        }
+        catch
+        {
+            maxOut = PacketLengthWithReportId;
+        }
+
+        // Prefer report-id-prefixed 65 when the device advertises >= 65 (or unknown).
+        // When max is exactly 64, try 64 first then 65 as fallback (some stacks are picky).
+        if (maxOut == PacketLengthPayloadOnly)
+            return new[] { PacketLengthPayloadOnly, PacketLengthWithReportId };
+
+        if (maxOut > 0 && maxOut < PacketLengthPayloadOnly)
+            return new[] { maxOut, PacketLengthWithReportId, PacketLengthPayloadOnly };
+
+        return new[] { PacketLengthWithReportId, PacketLengthPayloadOnly };
     }
 
     private static bool IsPreferredInterface(HidDevice device)
@@ -120,55 +201,57 @@ public static class CmArgbGen2HidController
         return !path.Contains("MI_", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>MI_01 first (drives LEDs on Marcus_PC), then MI_00, then unknown.</summary>
     private static int InterfaceSortKey(HidDevice device)
     {
         var path = device.DevicePath ?? "";
-        if (path.Contains("MI_00", StringComparison.OrdinalIgnoreCase)) return 0;
-        if (path.Contains("MI_01", StringComparison.OrdinalIgnoreCase)) return 1;
+        if (path.Contains("MI_01", StringComparison.OrdinalIgnoreCase)) return 0;
+        if (path.Contains("MI_00", StringComparison.OrdinalIgnoreCase)) return 1;
         return 2;
     }
 
-    private static void WritePacket(HidStream stream, byte[] packet)
+    private static byte[] BuildLightningControl(int length)
     {
-        stream.Write(packet);
-        stream.Flush();
-    }
-
-    private static byte[] BuildLightningControl()
-    {
-        var p = new byte[PacketLength];
-        p[0] = 0; // report id
-        p[1] = Cmd;
-        p[2] = LightningControl;
-        p[3] = Write;
+        var p = new byte[length];
+        // length 65: [0]=report id, [1..]=payload. length 64: payload starts at [0].
+        var o = length >= PacketLengthWithReportId ? 1 : 0;
+        if (o == 1)
+            p[0] = 0;
+        p[o] = Cmd;
+        p[o + 1] = LightningControl;
+        p[o + 2] = Write;
         return p;
     }
 
-    private static byte[] BuildHwModeSetupStatic(byte r, byte g, byte b, byte brightness)
+    private static byte[] BuildHwModeSetupStatic(int length, byte r, byte g, byte b, byte brightness)
     {
-        var p = new byte[PacketLength];
-        p[0] = 0;
-        p[1] = Cmd;
-        p[2] = HwModeSetup;
-        p[3] = Write;
-        p[4] = ChannelAll;
-        p[5] = SubchannelAll;
-        p[6] = StaticMode;
-        p[7] = DefaultSpeed;
-        p[8] = brightness;
-        p[9] = r;
-        p[10] = g;
-        p[11] = b;
+        var p = new byte[length];
+        var o = length >= PacketLengthWithReportId ? 1 : 0;
+        if (o == 1)
+            p[0] = 0;
+        p[o] = Cmd;
+        p[o + 1] = HwModeSetup;
+        p[o + 2] = Write;
+        p[o + 3] = ChannelAll;
+        p[o + 4] = SubchannelAll;
+        p[o + 5] = StaticMode;
+        p[o + 6] = DefaultSpeed;
+        p[o + 7] = brightness;
+        p[o + 8] = r;
+        p[o + 9] = g;
+        p[o + 10] = b;
         return p;
     }
 
-    private static byte[] BuildApplyChanges()
+    private static byte[] BuildApplyChanges(int length)
     {
-        var p = new byte[PacketLength];
-        p[0] = 0;
-        p[1] = Cmd;
-        p[2] = ApplyChanges;
-        p[3] = Write;
+        var p = new byte[length];
+        var o = length >= PacketLengthWithReportId ? 1 : 0;
+        if (o == 1)
+            p[0] = 0;
+        p[o] = Cmd;
+        p[o + 1] = ApplyChanges;
+        p[o + 2] = Write;
         return p;
     }
 }

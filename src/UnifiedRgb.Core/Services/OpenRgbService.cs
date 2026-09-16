@@ -22,6 +22,10 @@ public sealed class OpenRgbService : IOpenRgbService
     }
 
     public string? LastError { get; private set; }
+
+    /// <summary>Brief note from the last successful/partial apply (e.g. "CM Gen2: HID Static OK").</summary>
+    public string? LastStatus { get; private set; }
+
     public string Host { get; private set; } = "127.0.0.1";
     public int Port { get; private set; } = 6742;
 
@@ -104,11 +108,19 @@ public sealed class OpenRgbService : IOpenRgbService
             EnsureConnected();
             try
             {
-                ApplyToDevice(_client!, deviceIndex, color, brightness01);
+                var note = ApplyToDevice(_client!, deviceIndex, color, brightness01);
                 LastError = null;
+                LastStatus = note;
             }
             catch (Exception ex)
             {
+                LastStatus = null;
+                if (ex is InvalidOperationException && OperatingSystem.IsWindows() &&
+                    ex.Message.Contains("HID", StringComparison.OrdinalIgnoreCase))
+                {
+                    LastError = ex.Message;
+                    throw;
+                }
                 HandleLostConnection(ex);
                 throw;
             }
@@ -120,18 +132,59 @@ public sealed class OpenRgbService : IOpenRgbService
         lock (_gate)
         {
             EnsureConnected();
+
+            int count;
             try
             {
-                var count = _client!.GetControllerCount();
-                for (var i = 0; i < count; i++)
-                    ApplyToDevice(_client, i, color, brightness01);
-
-                LastError = null;
+                count = _client!.GetControllerCount();
             }
             catch (Exception ex)
             {
+                LastStatus = null;
                 HandleLostConnection(ex);
                 throw;
+            }
+
+            var errors = new List<string>();
+            var notes = new List<string>();
+            var ok = 0;
+
+            for (var i = 0; i < count; i++)
+            {
+                try
+                {
+                    var note = ApplyToDevice(_client!, i, color, brightness01);
+                    ok++;
+                    if (!string.IsNullOrWhiteSpace(note))
+                        notes.Add(note);
+                }
+                catch (Exception ex)
+                {
+                    // Continue per-device so one HID/SDK failure does not abort the rest.
+                    string name;
+                    try { name = _client!.GetControllerData(i).Name ?? $"Device {i}"; }
+                    catch { name = $"Device {i}"; }
+                    errors.Add($"{name}: {ex.Message}");
+                }
+            }
+
+            if (ok == 0 && count > 0)
+            {
+                LastError = string.Join("; ", errors);
+                LastStatus = null;
+                throw new InvalidOperationException(
+                    "Failed to apply color to all devices. " + LastError);
+            }
+
+            LastError = errors.Count > 0 ? string.Join("; ", errors) : null;
+            LastStatus = notes.Count > 0
+                ? string.Join(" | ", notes.Distinct())
+                : (ok > 0 ? $"OpenRGB UpdateLeds on {ok} device(s)" : null);
+
+            if (errors.Count > 0 && ok > 0)
+            {
+                // Partial success: keep going; surface combined status for UI.
+                LastStatus = $"{LastStatus}; partial errors: {LastError}";
             }
         }
     }
@@ -143,11 +196,19 @@ public sealed class OpenRgbService : IOpenRgbService
             EnsureConnected();
             try
             {
-                ApplyToZone(_client!, deviceIndex, zoneIndex, color, brightness01);
+                var note = ApplyToZone(_client!, deviceIndex, zoneIndex, color, brightness01);
                 LastError = null;
+                LastStatus = note;
             }
             catch (Exception ex)
             {
+                LastStatus = null;
+                if (ex is InvalidOperationException &&
+                    ex.Message.Contains("HID", StringComparison.OrdinalIgnoreCase))
+                {
+                    LastError = ex.Message;
+                    throw;
+                }
                 HandleLostConnection(ex);
                 throw;
             }
@@ -329,19 +390,28 @@ public sealed class OpenRgbService : IOpenRgbService
         }
     }
 
-    private static void ApplyToDevice(OpenRgbClient client, int deviceIndex, RgbColor color, double brightness01)
+    private static string ApplyToDevice(OpenRgbClient client, int deviceIndex, RgbColor color, double brightness01)
     {
         var device = client.GetControllerData(deviceIndex);
         var scaled = color.WithBrightness(brightness01);
+        var deviceLabel = device.Name ?? $"Device {deviceIndex}";
 
         // Cooler Master ARGB Gen2: OpenRGB set_mode/UpdateLeds often leaves Spectrum.
         // Drive solid color via Windows HID Static (VID 0x2516 PID 0x01C9).
         if (TryApplyCmGen2HidStatic(device.Name, scaled))
-            return;
+        {
+            // Best-effort: keep OpenRGB SDK/Direct state in sync; do not fail Apply if SDK mode is stuck.
+            TryBestEffortOpenRgbSync(client, deviceIndex, device, scaled);
+            return $"{deviceLabel}: HID Static OK";
+        }
 
         var ledCount = device.Leds.Length;
         if (ledCount == 0)
-            return;
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[UnifiedRgb] Skip UpdateLeds for '{deviceLabel}': LedCount==0 (resize zone or check OpenRGB).");
+            return $"{deviceLabel}: skipped (LedCount==0)";
+        }
 
         TryEnterDirectOrCustom(client, deviceIndex, device);
 
@@ -349,24 +419,33 @@ public sealed class OpenRgbService : IOpenRgbService
         var colors = new Color[ledCount];
         Array.Fill(colors, openRgbColor);
         client.UpdateLeds(deviceIndex, colors);
+        return $"{deviceLabel}: OpenRGB UpdateLeds";
     }
 
-    private static void ApplyToZone(OpenRgbClient client, int deviceIndex, int zoneIndex, RgbColor color, double brightness01)
+    private static string ApplyToZone(OpenRgbClient client, int deviceIndex, int zoneIndex, RgbColor color, double brightness01)
     {
         var device = client.GetControllerData(deviceIndex);
         if (zoneIndex < 0 || zoneIndex >= device.Zones.Length)
             throw new ArgumentOutOfRangeException(nameof(zoneIndex), $"Zone {zoneIndex} is out of range.");
 
         var scaled = color.WithBrightness(brightness01);
+        var deviceLabel = device.Name ?? $"Device {deviceIndex}";
 
         // Gen2 Static uses CHANNEL_ALL — solid color applies to the whole hub.
         if (TryApplyCmGen2HidStatic(device.Name, scaled))
-            return;
+        {
+            TryBestEffortOpenRgbSync(client, deviceIndex, device, scaled);
+            return $"{deviceLabel}: HID Static OK";
+        }
 
         var zone = device.Zones[zoneIndex];
         var ledCount = (int)zone.LedCount;
         if (ledCount == 0)
-            return;
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[UnifiedRgb] Skip UpdateZoneLeds for '{deviceLabel}' zone {zoneIndex}: LedCount==0.");
+            return $"{deviceLabel} zone {zoneIndex}: skipped (LedCount==0)";
+        }
 
         TryEnterDirectOrCustom(client, deviceIndex, device);
 
@@ -374,6 +453,33 @@ public sealed class OpenRgbService : IOpenRgbService
         var colors = new Color[ledCount];
         Array.Fill(colors, openRgbColor);
         client.UpdateZoneLeds(deviceIndex, zoneIndex, colors);
+        return $"{deviceLabel}: OpenRGB UpdateZoneLeds";
+    }
+
+    /// <summary>
+    /// After HID Static succeeds, optionally push Direct/UpdateLeds so SDK UI state matches.
+    /// Never throws — HID already drove the hardware.
+    /// </summary>
+    private static void TryBestEffortOpenRgbSync(
+        OpenRgbClient client, int deviceIndex, Device device, RgbColor scaled)
+    {
+        try
+        {
+            var ledCount = device.Leds.Length;
+            if (ledCount == 0)
+                return;
+
+            TryEnterDirectOrCustom(client, deviceIndex, device);
+            var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
+            var colors = new Color[ledCount];
+            Array.Fill(colors, openRgbColor);
+            client.UpdateLeds(deviceIndex, colors);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[UnifiedRgb] Best-effort OpenRGB sync after HID Static failed: {ex.Message}");
+        }
     }
 
     /// <summary>
