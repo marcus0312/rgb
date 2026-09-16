@@ -332,13 +332,19 @@ public sealed class OpenRgbService : IOpenRgbService
     private static void ApplyToDevice(OpenRgbClient client, int deviceIndex, RgbColor color, double brightness01)
     {
         var device = client.GetControllerData(deviceIndex);
+        var scaled = color.WithBrightness(brightness01);
+
+        // Cooler Master ARGB Gen2: OpenRGB set_mode/UpdateLeds often leaves Spectrum.
+        // Drive solid color via Windows HID Static (VID 0x2516 PID 0x01C9).
+        if (TryApplyCmGen2HidStatic(device.Name, scaled))
+            return;
+
         var ledCount = device.Leds.Length;
         if (ledCount == 0)
             return;
 
         TryEnterDirectOrCustom(client, deviceIndex, device);
 
-        var scaled = color.WithBrightness(brightness01);
         var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
         var colors = new Color[ledCount];
         Array.Fill(colors, openRgbColor);
@@ -351,6 +357,12 @@ public sealed class OpenRgbService : IOpenRgbService
         if (zoneIndex < 0 || zoneIndex >= device.Zones.Length)
             throw new ArgumentOutOfRangeException(nameof(zoneIndex), $"Zone {zoneIndex} is out of range.");
 
+        var scaled = color.WithBrightness(brightness01);
+
+        // Gen2 Static uses CHANNEL_ALL — solid color applies to the whole hub.
+        if (TryApplyCmGen2HidStatic(device.Name, scaled))
+            return;
+
         var zone = device.Zones[zoneIndex];
         var ledCount = (int)zone.LedCount;
         if (ledCount == 0)
@@ -358,11 +370,30 @@ public sealed class OpenRgbService : IOpenRgbService
 
         TryEnterDirectOrCustom(client, deviceIndex, device);
 
-        var scaled = color.WithBrightness(brightness01);
         var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
         var colors = new Color[ledCount];
         Array.Fill(colors, openRgbColor);
         client.UpdateZoneLeds(deviceIndex, zoneIndex, colors);
+    }
+
+    /// <summary>
+    /// When the OpenRGB device name is Cooler Master ARGB Gen2, send HID Static.
+    /// Throws if matching device but HID write fails on Windows (so UI shows the error).
+    /// Non-Windows / non-CM devices return false and keep the OpenRGB.NET path.
+    /// </summary>
+    private static bool TryApplyCmGen2HidStatic(string? deviceName, RgbColor scaled)
+    {
+        if (!CmArgbGen2HidController.IsCoolerMasterArgbGen2(deviceName))
+            return false;
+
+        if (CmArgbGen2HidController.TrySetStaticColor(scaled.R, scaled.G, scaled.B, out var hidError))
+            return true;
+
+        if (!OperatingSystem.IsWindows())
+            return false;
+
+        throw new InvalidOperationException(
+            hidError ?? "Cooler Master ARGB Gen2 HID Static failed.");
     }
 
     private static void TryEnterDirectOrCustom(OpenRgbClient client, int deviceIndex, Device device)
