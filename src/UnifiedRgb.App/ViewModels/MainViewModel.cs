@@ -1,6 +1,7 @@
 using System;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Media;
 using Avalonia.Threading;
@@ -13,15 +14,28 @@ namespace UnifiedRgb.App.ViewModels;
 
 public partial class MainViewModel : ViewModelBase, IDisposable
 {
+    private const int DefaultSuggestedLedCount = 24;
+    private const int StartupConnectAttempts = 12;
+    private const int StartupConnectDelayMs = 2500;
+
     private readonly OpenRgbService _openRgb = new();
     private readonly ProfileStore _profiles = new();
+    private readonly SettingsStore _settingsStore = new();
+    private AppSettings _settings;
+    private bool _suppressZoneLedSync;
+    private bool _suppressSettingsPersist;
+    private CancellationTokenSource? _startupCts;
+    private bool _startupFlowStarted;
 
     [ObservableProperty] private string _host = "127.0.0.1";
     [ObservableProperty] private string _portText = "6742";
     [ObservableProperty] private bool _isConnected;
     [ObservableProperty] private string _statusText = "Disconnected — start OpenRGB SDK Server (default port 6742).";
+    [ObservableProperty] private string? _vendorConflictWarning;
     [ObservableProperty] private bool _isBusy;
     [ObservableProperty] private DeviceInfo? _selectedDevice;
+    [ObservableProperty] private ZoneInfo? _selectedZone;
+    [ObservableProperty] private int _zoneLedCount = DefaultSuggestedLedCount;
     [ObservableProperty] private int _red = 255;
     [ObservableProperty] private int _green;
     [ObservableProperty] private int _blue;
@@ -29,8 +43,13 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private string _profileName = "My Profile";
     [ObservableProperty] private string? _selectedProfileName;
     [ObservableProperty] private string _colorHex = "#FF0000";
+    [ObservableProperty] private bool _startWithWindows;
+    [ObservableProperty] private bool _startMinimized;
+    [ObservableProperty] private bool _closeToTray = true;
+    [ObservableProperty] private bool _autoApplyOnLaunch = true;
 
     public ObservableCollection<DeviceInfo> Devices { get; } = new();
+    public ObservableCollection<ZoneInfo> Zones { get; } = new();
     public ObservableCollection<string> ProfileNames { get; } = new();
 
     public IBrush PreviewBrush => new SolidColorBrush(Color.FromRgb((byte)Red, (byte)Green, (byte)Blue));
@@ -42,11 +61,75 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             : new SolidColorBrush(Color.FromRgb(180, 60, 60));
 
     public string ProfilesFolder => _profiles.DirectoryPath;
+    public string SettingsFolder => _settingsStore.DirectoryPath;
+    public bool AutostartSupported => AutostartService.IsSupported;
+    public bool HasVendorConflict => !string.IsNullOrWhiteSpace(VendorConflictWarning);
+
+    /// <summary>Raised when the UI should show the main window (tray → Show).</summary>
+    public event EventHandler? ShowWindowRequested;
+
+    /// <summary>Raised when the app should exit fully (tray → Exit).</summary>
+    public event EventHandler? ExitRequested;
+
+    /// <summary>Raised when the profile list changes (tray submenu refresh).</summary>
+    public event EventHandler? ProfilesChanged;
+
+    public string ZoneLimitsHint
+    {
+        get
+        {
+            if (SelectedZone is null)
+                return "Select a channel/zone to resize ARGB strips (e.g. CM Gen2 A1 V2).";
+            var z = SelectedZone;
+            return $"Current {z.LedCount} LEDs · min {z.LedsMin} · max {z.LedsMax}" +
+                   (z.LedCount == 0 ? " — resize before lights will work." : "");
+        }
+    }
 
     public MainViewModel()
     {
+        _settings = _settingsStore.Load();
+        _suppressSettingsPersist = true;
+        try
+        {
+            Host = string.IsNullOrWhiteSpace(_settings.Host) ? "127.0.0.1" : _settings.Host;
+            PortText = _settings.Port is >= 1 and <= 65535 ? _settings.Port.ToString() : "6742";
+            StartWithWindows = _settings.StartWithWindows;
+            StartMinimized = _settings.StartMinimized;
+            CloseToTray = _settings.CloseToTray;
+            AutoApplyOnLaunch = _settings.AutoApplyOnLaunch;
+            if (!string.IsNullOrWhiteSpace(_settings.LastProfileName))
+            {
+                ProfileName = _settings.LastProfileName;
+                SelectedProfileName = _settings.LastProfileName;
+            }
+        }
+        finally
+        {
+            _suppressSettingsPersist = false;
+        }
+
         _openRgb.ConnectionChanged += OnConnectionChanged;
         RefreshProfileList();
+        RefreshVendorConflicts();
+    }
+
+    /// <summary>Call once after the UI is ready — connect with retry and auto-apply last profile.</summary>
+    public void BeginStartupFlow()
+    {
+        if (_startupFlowStarted)
+            return;
+        _startupFlowStarted = true;
+
+        // Keep HKCU Run key in sync with the setting on first launch of an installed build.
+        if (AutostartService.IsSupported && StartWithWindows)
+        {
+            try { AutostartService.SetEnabled(true, StartMinimized); }
+            catch { /* ignore registry failures */ }
+        }
+
+        _startupCts = new CancellationTokenSource();
+        _ = RunStartupConnectAsync(_startupCts.Token);
     }
 
     partial void OnRedChanged(int value) => NotifyColorChanged();
@@ -58,10 +141,131 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         OnPropertyChanged(nameof(ConnectionBadgeBrush));
     }
 
+    partial void OnVendorConflictWarningChanged(string? value) =>
+        OnPropertyChanged(nameof(HasVendorConflict));
+
+    partial void OnSelectedDeviceChanged(DeviceInfo? value) => PopulateZonesFromDevice(value);
+
+    partial void OnSelectedZoneChanged(ZoneInfo? value)
+    {
+        SyncZoneLedCountFromSelection(value);
+        OnPropertyChanged(nameof(ZoneLimitsHint));
+    }
+
+    partial void OnHostChanged(string value) => PersistSettings();
+    partial void OnPortTextChanged(string value) => PersistSettings();
+    partial void OnStartMinimizedChanged(bool value)
+    {
+        if (!_suppressSettingsPersist && AutostartService.IsSupported && StartWithWindows)
+        {
+            try { AutostartService.SetEnabled(true, value); }
+            catch { /* ignore */ }
+        }
+        PersistSettings();
+    }
+    partial void OnCloseToTrayChanged(bool value) => PersistSettings();
+    partial void OnAutoApplyOnLaunchChanged(bool value) => PersistSettings();
+
+    partial void OnStartWithWindowsChanged(bool value)
+    {
+        if (_suppressSettingsPersist)
+            return;
+
+        try
+        {
+            if (AutostartService.IsSupported)
+                AutostartService.SetEnabled(value, StartMinimized);
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Could not update Start with Windows: {ex.Message}";
+        }
+
+        PersistSettings();
+    }
+
+    partial void OnSelectedProfileNameChanged(string? value)
+    {
+        if (_suppressSettingsPersist || string.IsNullOrWhiteSpace(value))
+            return;
+        _settings.LastProfileName = value;
+        PersistSettings();
+    }
+
     private void NotifyColorChanged()
     {
         ColorHex = $"#{(byte)Red:X2}{(byte)Green:X2}{(byte)Blue:X2}";
         OnPropertyChanged(nameof(PreviewBrush));
+    }
+
+    private void PersistSettings()
+    {
+        if (_suppressSettingsPersist)
+            return;
+
+        _settings.Host = Host?.Trim() ?? "127.0.0.1";
+        if (int.TryParse(PortText.Trim(), out var port) && port is >= 1 and <= 65535)
+            _settings.Port = port;
+        _settings.StartWithWindows = StartWithWindows;
+        _settings.StartMinimized = StartMinimized;
+        _settings.CloseToTray = CloseToTray;
+        _settings.AutoApplyOnLaunch = AutoApplyOnLaunch;
+        if (!string.IsNullOrWhiteSpace(SelectedProfileName))
+            _settings.LastProfileName = SelectedProfileName;
+        else if (!string.IsNullOrWhiteSpace(ProfileName))
+            _settings.LastProfileName = ProfileName.Trim();
+
+        try { _settingsStore.Save(_settings); }
+        catch { /* best-effort */ }
+    }
+
+    private void PopulateZonesFromDevice(DeviceInfo? device)
+    {
+        var previousZoneIndex = SelectedZone?.Index;
+        Zones.Clear();
+
+        if (device?.Zones is { Count: > 0 })
+        {
+            foreach (var z in device.Zones)
+                Zones.Add(z);
+
+            SelectedZone = previousZoneIndex is int idx
+                ? Zones.FirstOrDefault(z => z.Index == idx) ?? Zones[0]
+                : Zones[0];
+        }
+        else
+        {
+            SelectedZone = null;
+            if (!_suppressZoneLedSync)
+                ZoneLedCount = DefaultSuggestedLedCount;
+        }
+
+        OnPropertyChanged(nameof(ZoneLimitsHint));
+    }
+
+    private void SyncZoneLedCountFromSelection(ZoneInfo? zone)
+    {
+        if (_suppressZoneLedSync)
+            return;
+
+        if (zone is null)
+        {
+            ZoneLedCount = DefaultSuggestedLedCount;
+            return;
+        }
+
+        if (zone.LedCount > 0)
+        {
+            ZoneLedCount = (int)zone.LedCount;
+            return;
+        }
+
+        if (zone.LedsMax == 0 || zone.LedsMax >= DefaultSuggestedLedCount)
+            ZoneLedCount = DefaultSuggestedLedCount;
+        else if (zone.LedsMax > 0)
+            ZoneLedCount = (int)zone.LedsMax;
+        else
+            ZoneLedCount = DefaultSuggestedLedCount;
     }
 
     private void OnConnectionChanged(object? sender, EventArgs e)
@@ -72,13 +276,102 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             if (!IsConnected)
             {
                 Devices.Clear();
+                Zones.Clear();
                 SelectedDevice = null;
+                SelectedZone = null;
                 if (!string.IsNullOrWhiteSpace(_openRgb.LastError))
                     StatusText = _openRgb.LastError;
                 else
                     StatusText = "Disconnected.";
             }
         });
+    }
+
+    private async Task RunStartupConnectAsync(CancellationToken ct)
+    {
+        RefreshVendorConflicts();
+
+        for (var attempt = 1; attempt <= StartupConnectAttempts; attempt++)
+        {
+            if (ct.IsCancellationRequested)
+                return;
+
+            if (!int.TryParse(PortText.Trim(), out var port) || port is < 1 or > 65535)
+            {
+                StatusText = "Port must be a number between 1 and 65535.";
+                return;
+            }
+
+            StatusText = attempt == 1
+                ? $"Connecting to {Host}:{port}…"
+                : $"Waiting for OpenRGB at {Host}:{port} (attempt {attempt}/{StartupConnectAttempts})…";
+
+            try
+            {
+                await Task.Run(() => _openRgb.Connect(Host, port), ct);
+                await Dispatcher.UIThread.InvokeAsync(async () =>
+                {
+                    IsConnected = true;
+                    StatusText = $"Connected to OpenRGB SDK at {_openRgb.Host}:{_openRgb.Port}.";
+                    RefreshVendorConflicts();
+                    await RefreshDevicesAsync();
+                    if (AutoApplyOnLaunch)
+                        await AutoApplyLastProfileAsync();
+                });
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch
+            {
+                if (attempt >= StartupConnectAttempts)
+                {
+                    await Dispatcher.UIThread.InvokeAsync(() =>
+                    {
+                        IsConnected = false;
+                        StatusText =
+                            $"Could not reach OpenRGB at {Host}:{port} after {StartupConnectAttempts} tries. Start the SDK Server and click Connect.";
+                        RefreshVendorConflicts();
+                    });
+                    return;
+                }
+
+                try
+                {
+                    await Task.Delay(StartupConnectDelayMs, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    private async Task AutoApplyLastProfileAsync()
+    {
+        var name = _settings.LastProfileName ?? SelectedProfileName;
+        if (string.IsNullOrWhiteSpace(name))
+            return;
+
+        var profile = _profiles.Load(name);
+        if (profile is null)
+        {
+            StatusText = $"Connected — last profile \"{name}\" not found on disk.";
+            return;
+        }
+
+        SelectedProfileName = profile.Name;
+        ProfileName = profile.Name;
+        await ApplyLoadedProfileAsync(profile, announcePrefix: "Auto-applied");
+    }
+
+    public void RefreshVendorConflicts()
+    {
+        var conflicts = VendorConflictDetector.DetectRunning();
+        VendorConflictWarning = VendorConflictDetector.FormatWarning(conflicts);
     }
 
     [RelayCommand]
@@ -90,6 +383,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             return;
         }
 
+        PersistSettings();
         IsBusy = true;
         StatusText = $"Connecting to {Host}:{port}…";
         try
@@ -97,6 +391,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             await Task.Run(() => _openRgb.Connect(Host, port));
             IsConnected = true;
             StatusText = $"Connected to OpenRGB SDK at {_openRgb.Host}:{_openRgb.Port}.";
+            RefreshVendorConflicts();
             await RefreshDevicesAsync();
         }
         catch (Exception ex)
@@ -104,6 +399,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             IsConnected = false;
             StatusText = ex.Message;
             Devices.Clear();
+            Zones.Clear();
+            RefreshVendorConflicts();
         }
         finally
         {
@@ -117,7 +414,9 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         _openRgb.Disconnect();
         IsConnected = false;
         Devices.Clear();
+        Zones.Clear();
         SelectedDevice = null;
+        SelectedZone = null;
         StatusText = "Disconnected.";
     }
 
@@ -133,24 +432,99 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         IsBusy = true;
         try
         {
+            var previousDeviceIndex = SelectedDevice?.Index;
+            var previousZoneIndex = SelectedZone?.Index;
+            var previousLedCount = ZoneLedCount;
+
             var list = await Task.Run(() => _openRgb.ListDevices());
             Devices.Clear();
             foreach (var d in list)
                 Devices.Add(d);
 
-            if (SelectedDevice is not null)
-                SelectedDevice = Devices.FirstOrDefault(d => d.Index == SelectedDevice.Index);
+            _suppressZoneLedSync = true;
+            try
+            {
+                if (previousDeviceIndex is int di)
+                    SelectedDevice = Devices.FirstOrDefault(d => d.Index == di);
+                else
+                    SelectedDevice = Devices.FirstOrDefault();
 
-            StatusText = Devices.Count == 0
+                if (SelectedDevice is not null && previousZoneIndex is int zi)
+                {
+                    var match = Zones.FirstOrDefault(z => z.Index == zi);
+                    if (match is not null)
+                        SelectedZone = match;
+                }
+
+                ZoneLedCount = previousLedCount;
+            }
+            finally
+            {
+                _suppressZoneLedSync = false;
+            }
+
+            OnPropertyChanged(nameof(ZoneLimitsHint));
+            RefreshVendorConflicts();
+
+            var baseStatus = Devices.Count == 0
                 ? "Connected — no devices detected. Check OpenRGB device list / PawnIO / close vendor RGB apps."
                 : $"Connected — {Devices.Count} device(s).";
+            StatusText = string.IsNullOrWhiteSpace(VendorConflictWarning)
+                ? baseStatus
+                : baseStatus + " " + VendorConflictWarning;
         }
         catch (Exception ex)
         {
             IsConnected = _openRgb.IsConnected;
             StatusText = ex.Message;
             if (!IsConnected)
+            {
                 Devices.Clear();
+                Zones.Clear();
+            }
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    [RelayCommand]
+    private async Task ApplyResizeAsync()
+    {
+        if (SelectedDevice is null)
+        {
+            StatusText = "Select a device first.";
+            return;
+        }
+
+        if (SelectedZone is null)
+        {
+            StatusText = "Select a channel/zone first.";
+            return;
+        }
+
+        if (ZoneLedCount < 0)
+        {
+            StatusText = "LED count must be >= 0.";
+            return;
+        }
+
+        IsBusy = true;
+        try
+        {
+            var deviceIndex = SelectedDevice.Index;
+            var zoneIndex = SelectedZone.Index;
+            var size = ZoneLedCount;
+            var zoneName = SelectedZone.Name;
+            await Task.Run(() => _openRgb.ResizeZone(deviceIndex, zoneIndex, size));
+            StatusText = $"Applied size {size} LED(s) on \"{zoneName}\" ({SelectedDevice.Name}) via ResizeZone/ConfigureZone.";
+            await RefreshDevicesAsync();
+        }
+        catch (Exception ex)
+        {
+            StatusText = ex.Message;
+            IsConnected = _openRgb.IsConnected;
         }
         finally
         {
@@ -172,9 +546,34 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         {
             var color = CurrentColor();
             var bright = Brightness / 100.0;
-            var index = SelectedDevice.Index;
-            await Task.Run(() => _openRgb.ApplySolidColor(index, color, bright));
-            StatusText = $"Applied {color.ToHex()} @ {Brightness:0}% to {SelectedDevice.Name}.";
+            var deviceIndex = SelectedDevice.Index;
+            var deviceName = SelectedDevice.Name;
+
+            if (SelectedZone is not null)
+            {
+                var zoneIndex = SelectedZone.Index;
+                var zoneName = SelectedZone.Name;
+                var ledCount = SelectedZone.LedCount;
+                var desiredSize = ZoneLedCount > 0 ? ZoneLedCount : DefaultSuggestedLedCount;
+
+                await Task.Run(() =>
+                {
+                    if (ledCount == 0)
+                        _openRgb.ResizeZone(deviceIndex, zoneIndex, desiredSize);
+
+                    _openRgb.ApplySolidColorToZone(deviceIndex, zoneIndex, color, bright);
+                });
+
+                StatusText = AppendLastStatus(ledCount == 0
+                    ? $"Resized \"{zoneName}\" to {desiredSize} then applied {color.ToHex()} @ {Brightness:0}%."
+                    : $"Applied {color.ToHex()} @ {Brightness:0}% to zone \"{zoneName}\" on {deviceName}.");
+            }
+            else
+            {
+                await Task.Run(() => _openRgb.ApplySolidColor(deviceIndex, color, bright));
+                StatusText = AppendLastStatus($"Applied {color.ToHex()} @ {Brightness:0}% to {deviceName}.");
+            }
+
             await RefreshDevicesAsync();
         }
         catch (Exception ex)
@@ -203,7 +602,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             var color = CurrentColor();
             var bright = Brightness / 100.0;
             await Task.Run(() => _openRgb.ApplySolidColorToAll(color, bright));
-            StatusText = $"Synced {color.ToHex()} @ {Brightness:0}% to all devices.";
+            StatusText = AppendLastStatus($"Synced {color.ToHex()} @ {Brightness:0}% to all devices.");
             await RefreshDevicesAsync();
         }
         catch (Exception ex)
@@ -215,6 +614,48 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         {
             IsBusy = false;
         }
+    }
+
+    /// <summary>Tray: sync all using last profile if set, otherwise current picker color.</summary>
+    [RelayCommand]
+    private async Task TraySyncAllAsync()
+    {
+        if (!IsConnected)
+        {
+            await ConnectAsync();
+            if (!IsConnected)
+                return;
+        }
+
+        var name = _settings.LastProfileName ?? SelectedProfileName;
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            var profile = _profiles.Load(name);
+            if (profile is not null)
+            {
+                SelectedProfileName = profile.Name;
+                ProfileName = profile.Name;
+                await ApplyLoadedProfileAsync(profile, announcePrefix: "Tray sync");
+                return;
+            }
+        }
+
+        await ApplyToAllAsync();
+    }
+
+    [RelayCommand]
+    private void TrayShow() => ShowWindowRequested?.Invoke(this, EventArgs.Empty);
+
+    [RelayCommand]
+    private void TrayExit() => ExitRequested?.Invoke(this, EventArgs.Empty);
+
+    [RelayCommand]
+    private async Task TrayLoadProfileAsync(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return;
+        SelectedProfileName = name;
+        await LoadProfileAsync();
     }
 
     [RelayCommand]
@@ -260,7 +701,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 }).ToList()
             };
 
-            // Prefer the picker color for every device when saving an intentional look
             var pick = CurrentColor();
             foreach (var entry in profile.Devices)
             {
@@ -272,6 +712,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             _profiles.Save(profile);
             RefreshProfileList();
             SelectedProfileName = profile.Name;
+            _settings.LastProfileName = profile.Name;
+            PersistSettings();
             StatusText = $"Saved profile \"{profile.Name}\" → {_profiles.DirectoryPath}";
         }
         catch (Exception ex)
@@ -298,6 +740,28 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         }
 
         ProfileName = profile.Name;
+        _settings.LastProfileName = profile.Name;
+        PersistSettings();
+
+        if (!IsConnected)
+        {
+            if (profile.Devices.Count > 0)
+            {
+                var first = profile.Devices[0];
+                Red = first.R;
+                Green = first.G;
+                Blue = first.B;
+            }
+            Brightness = Math.Clamp(profile.Brightness * 100.0, 0, 100);
+            StatusText = $"Loaded \"{profile.Name}\" into picker (not connected — connect to apply).";
+            return;
+        }
+
+        await ApplyLoadedProfileAsync(profile, announcePrefix: "Loaded and applied");
+    }
+
+    private async Task ApplyLoadedProfileAsync(ColorProfile profile, string announcePrefix)
+    {
         Brightness = Math.Clamp(profile.Brightness * 100.0, 0, 100);
 
         if (profile.Devices.Count > 0)
@@ -306,12 +770,6 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             Red = first.R;
             Green = first.G;
             Blue = first.B;
-        }
-
-        if (!IsConnected)
-        {
-            StatusText = $"Loaded \"{profile.Name}\" into picker (not connected — connect to apply).";
-            return;
         }
 
         IsBusy = true;
@@ -332,7 +790,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                 }
             });
 
-            StatusText = $"Loaded and applied profile \"{profile.Name}\".";
+            StatusText = AppendLastStatus($"{announcePrefix} profile \"{profile.Name}\".");
             await RefreshDevicesAsync();
         }
         catch (Exception ex)
@@ -375,12 +833,22 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         ProfileNames.Clear();
         foreach (var n in _profiles.ListProfiles())
             ProfileNames.Add(n);
+        ProfilesChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private string AppendLastStatus(string baseStatus)
+    {
+        var note = _openRgb.LastStatus;
+        return string.IsNullOrWhiteSpace(note) ? baseStatus : $"{baseStatus} ({note})";
     }
 
     private RgbColor CurrentColor() => new((byte)Red, (byte)Green, (byte)Blue);
 
     public void Dispose()
     {
+        try { _startupCts?.Cancel(); } catch { /* ignore */ }
+        _startupCts?.Dispose();
+        PersistSettings();
         _openRgb.ConnectionChanged -= OnConnectionChanged;
         _openRgb.Dispose();
     }

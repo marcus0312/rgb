@@ -3,13 +3,13 @@
         xmlns:vm="using:UnifiedRgb.App.ViewModels"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        mc:Ignorable="d" d:DesignWidth="960" d:DesignHeight="640"
+        mc:Ignorable="d" d:DesignWidth="960" d:DesignHeight="720"
         x:Class="UnifiedRgb.App.Views.MainWindow"
         x:DataType="vm:MainViewModel"
-        Width="980" Height="680"
-        MinWidth="800" MinHeight="560"
+        Width="980" Height="760"
+        MinWidth="800" MinHeight="600"
         WindowStartupLocation="CenterScreen"
-        Title="Unified RGB — OpenRGB Controller">
+        Title="Unified RGB">
 
   <Design.DataContext>
     <vm:MainViewModel />
@@ -36,6 +36,12 @@
     <Border DockPanel.Dock="Bottom" Padding="10,8" CornerRadius="6" Margin="0,8,0,0"
             Background="{DynamicResource SystemControlBackgroundChromeMediumBrush}">
       <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" FontSize="12" Opacity="0.9" />
+    </Border>
+
+    <Border DockPanel.Dock="Top" Padding="10,8" CornerRadius="6" Margin="0,0,0,10"
+            Background="#5A3A10" IsVisible="{Binding HasVendorConflict}">
+      <TextBlock Text="{Binding VendorConflictWarning}" TextWrapping="Wrap"
+                 FontSize="12" Foreground="#FFD89A" />
     </Border>
 
     <Grid ColumnDefinitions="*,14,320" RowDefinitions="Auto,12,*">
@@ -91,9 +97,37 @@
         </DockPanel>
       </Border>
 
-      <!-- Color + Profiles -->
+      <!-- Color + Channel + Profiles + Settings -->
       <ScrollViewer Grid.Row="2" Grid.Column="2" VerticalScrollBarVisibility="Auto">
         <StackPanel>
+          <Border Classes="card">
+            <StackPanel Spacing="10">
+              <TextBlock Classes="section" Text="Channel / Zone" Margin="0" />
+              <ComboBox ItemsSource="{Binding Zones}"
+                        SelectedItem="{Binding SelectedZone}"
+                        HorizontalAlignment="Stretch"
+                        PlaceholderText="Select channel…">
+                <ComboBox.ItemTemplate>
+                  <DataTemplate>
+                    <TextBlock Text="{Binding DisplayLine}" />
+                  </DataTemplate>
+                </ComboBox.ItemTemplate>
+              </ComboBox>
+              <DockPanel>
+                <TextBlock Text="LED count" Width="72" VerticalAlignment="Center" />
+                <NumericUpDown Value="{Binding ZoneLedCount}"
+                               Minimum="0" Maximum="512"
+                               Increment="1" FormatString="0"
+                               HorizontalAlignment="Stretch"
+                               IsEnabled="{Binding IsConnected}" />
+              </DockPanel>
+              <TextBlock FontSize="11" Opacity="0.65" TextWrapping="Wrap"
+                         Text="{Binding ZoneLimitsHint}" />
+              <Button Content="Apply size" Command="{Binding ApplyResizeCommand}"
+                      HorizontalAlignment="Stretch" IsEnabled="{Binding IsConnected}" />
+            </StackPanel>
+          </Border>
+
           <Border Classes="card">
             <StackPanel Spacing="10">
               <TextBlock Classes="section" Text="Color" Margin="0" />
@@ -129,7 +163,7 @@
               </DockPanel>
 
               <TextBlock FontSize="11" Opacity="0.65" TextWrapping="Wrap"
-                         Text="Brightness scales RGB client-side (OpenRGB.NET has no UpdateMode brightness param)." />
+                         Text="Apply uses the selected channel when set. If LED count is 0, it auto-applies size (default 24, ConfigureZone for CM Gen2) then UpdateZoneLeds." />
               <Button Content="Apply to selected" Command="{Binding ApplyToSelectedCommand}"
                       HorizontalAlignment="Stretch" IsEnabled="{Binding IsConnected}" />
               <Button Content="Sync all devices" Command="{Binding ApplyToAllCommand}"
@@ -137,7 +171,7 @@
             </StackPanel>
           </Border>
 
-          <Border Classes="card" Margin="0">
+          <Border Classes="card">
             <StackPanel Spacing="8">
               <TextBlock Classes="section" Text="Profiles" Margin="0" />
               <TextBox Text="{Binding ProfileName}" Watermark="Profile name" />
@@ -153,6 +187,19 @@
               </StackPanel>
               <TextBlock FontSize="11" Opacity="0.65" TextWrapping="Wrap"
                          Text="{Binding ProfilesFolder, StringFormat=Stored under: {0}}" />
+            </StackPanel>
+          </Border>
+
+          <Border Classes="card" Margin="0">
+            <StackPanel Spacing="8">
+              <TextBlock Classes="section" Text="Settings" Margin="0" />
+              <CheckBox Content="Start with Windows" IsChecked="{Binding StartWithWindows}"
+                        IsEnabled="{Binding AutostartSupported}" />
+              <CheckBox Content="Start minimized (tray)" IsChecked="{Binding StartMinimized}" />
+              <CheckBox Content="Close to tray" IsChecked="{Binding CloseToTray}" />
+              <CheckBox Content="Auto-apply last profile on launch" IsChecked="{Binding AutoApplyOnLaunch}" />
+              <TextBlock FontSize="11" Opacity="0.65" TextWrapping="Wrap"
+                         Text="{Binding SettingsFolder, StringFormat=Settings JSON: {0}/settings.json · Tray: Show / Sync all / Load profile / Exit}" />
             </StackPanel>
           </Border>
         </StackPanel>
