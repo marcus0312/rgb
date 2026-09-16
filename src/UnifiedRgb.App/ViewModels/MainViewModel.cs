@@ -27,6 +27,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     private CancellationTokenSource? _startupCts;
     private bool _startupFlowStarted;
     private bool _suppressDeviceEffectSync;
+    private bool _suppressHexSync;
+    private CancellationTokenSource? _hexDebounceCts;
     private string? _effectStateDeviceKey;
     private readonly Dictionary<string, DeviceEffectState> _deviceEffects =
         new(StringComparer.OrdinalIgnoreCase);
@@ -144,6 +146,13 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     partial void OnRedChanged(int value) => NotifyColorChanged();
     partial void OnGreenChanged(int value) => NotifyColorChanged();
     partial void OnBlueChanged(int value) => NotifyColorChanged();
+
+    partial void OnColorHexChanged(string value)
+    {
+        if (_suppressHexSync)
+            return;
+        DebounceParseHex(value);
+    }
     partial void OnIsConnectedChanged(bool value)
     {
         OnPropertyChanged(nameof(ConnectionBadge));
@@ -215,8 +224,70 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
     private void NotifyColorChanged()
     {
-        ColorHex = $"#{(byte)Red:X2}{(byte)Green:X2}{(byte)Blue:X2}";
+        if (!_suppressHexSync)
+        {
+            _suppressHexSync = true;
+            try
+            {
+                ColorHex = $"#{(byte)Math.Clamp(Red, 0, 255):X2}{(byte)Math.Clamp(Green, 0, 255):X2}{(byte)Math.Clamp(Blue, 0, 255):X2}";
+            }
+            finally
+            {
+                _suppressHexSync = false;
+            }
+        }
+
         OnPropertyChanged(nameof(PreviewBrush));
+    }
+
+    private void DebounceParseHex(string? text)
+    {
+        _hexDebounceCts?.Cancel();
+        _hexDebounceCts?.Dispose();
+        _hexDebounceCts = new CancellationTokenSource();
+        var token = _hexDebounceCts.Token;
+        _ = DebounceParseHexAsync(text, token);
+    }
+
+    private async Task DebounceParseHexAsync(string? text, CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(250, token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        if (token.IsCancellationRequested)
+            return;
+
+        await Dispatcher.UIThread.InvokeAsync(() => TryApplyHexText(text, normalizeHex: true));
+    }
+
+    /// <summary>Parse hex into RGB without feedback loops. Returns true when applied.</summary>
+    public bool TryApplyHexText(string? text, bool normalizeHex = true)
+    {
+        if (!RgbColor.TryFromHex(text, out var c))
+            return false;
+
+        _suppressHexSync = true;
+        try
+        {
+            Red = c.R;
+            Green = c.G;
+            Blue = c.B;
+            if (normalizeHex)
+                ColorHex = c.ToHex();
+        }
+        finally
+        {
+            _suppressHexSync = false;
+        }
+
+        OnPropertyChanged(nameof(PreviewBrush));
+        return true;
     }
 
     private void PersistSettings()
@@ -698,10 +769,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [RelayCommand]
     private void ParseHex()
     {
-        var c = RgbColor.FromHex(ColorHex);
-        Red = c.R;
-        Green = c.G;
-        Blue = c.B;
+        if (!TryApplyHexText(ColorHex, normalizeHex: true))
+            StatusText = "Could not parse hex — use #RGB, #RRGGBB, or RRGGBB.";
     }
 
     [RelayCommand]
@@ -1073,6 +1142,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     {
         try { _startupCts?.Cancel(); } catch { /* ignore */ }
         _startupCts?.Dispose();
+        try { _hexDebounceCts?.Cancel(); } catch { /* ignore */ }
+        _hexDebounceCts?.Dispose();
         PersistSettings();
         _openRgb.ConnectionChanged -= OnConnectionChanged;
         _openRgb.Dispose();

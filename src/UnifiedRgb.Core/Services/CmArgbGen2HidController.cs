@@ -76,12 +76,9 @@ public static class CmArgbGen2HidController
         return null;
     }
 
-    /// <summary>Map UI speed 0–100 to CM HID speed byte (0x00–0x04).</summary>
-    public static byte MapSpeed01ToHw(double speed01)
-    {
-        speed01 = Math.Clamp(speed01, 0, 1);
-        return (byte)Math.Round(SpeedMin + speed01 * (SpeedMax - SpeedMin));
-    }
+    /// <summary>Map UI speed 0–1 to CM HID speed byte via shared Sync tiers (0x00–0x04).</summary>
+    public static byte MapSpeed01ToHw(double speed01) =>
+        EffectSpeedSync.MapCmHid(speed01);
 
     /// <summary>Map brightness 0–1 to CM HID brightness byte.</summary>
     public static byte MapBrightness01ToHw(double brightness01) =>

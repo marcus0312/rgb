@@ -12,6 +12,8 @@ public sealed class OpenRgbService : IOpenRgbService
     private OpenRgbClient? _client;
     private readonly object _gate = new();
     private int _timeoutMs = 1500;
+    /// <summary>When true (Sync all), skip inter-device sleeps so hardware effects start in phase.</summary>
+    private bool _syncBatch;
 
     public bool IsConnected
     {
@@ -166,23 +168,51 @@ public sealed class OpenRgbService : IOpenRgbService
             var errors = new List<string>();
             var notes = new List<string>();
             var ok = 0;
+            var modeLabel = string.IsNullOrWhiteSpace(modeName) ? "Static" : modeName.Trim();
+            var tier = EffectSpeedSync.ToTier(speed01);
 
-            for (var i = 0; i < count; i++)
+            // Sync all: minimal/no inter-device delay so Breathing (etc.) starts in phase.
+            _syncBatch = true;
+            try
             {
-                try
+                for (var i = 0; i < count; i++)
                 {
-                    var note = ApplyEffectToDevice(i, color, modeName, speed01, brightness01);
-                    ok++;
-                    if (!string.IsNullOrWhiteSpace(note))
-                        notes.Add(note);
+                    try
+                    {
+                        var note = ApplyEffectToDevice(i, color, modeLabel, speed01, brightness01);
+                        ok++;
+                        if (!string.IsNullOrWhiteSpace(note))
+                            notes.Add(note);
+                    }
+                    catch (Exception ex)
+                    {
+                        string name;
+                        try { name = _client!.GetControllerData(i).Name ?? $"Device {i}"; }
+                        catch { name = $"Device {i}"; }
+                        errors.Add($"{name}: {ex.Message}");
+                    }
                 }
-                catch (Exception ex)
+
+                // Second pass: re-assert the same mode+speed so devices that finished
+                // first are nudged back into the same tier after the batch completes.
+                if (ok > 0 && NeedsSpeedReassert(modeLabel))
                 {
-                    string name;
-                    try { name = _client!.GetControllerData(i).Name ?? $"Device {i}"; }
-                    catch { name = $"Device {i}"; }
-                    errors.Add($"{name}: {ex.Message}");
+                    for (var i = 0; i < count; i++)
+                    {
+                        try
+                        {
+                            _ = ApplyEffectToDevice(i, color, modeLabel, speed01, brightness01);
+                        }
+                        catch
+                        {
+                            // Best-effort re-assert; first-pass notes/errors already recorded.
+                        }
+                    }
                 }
+            }
+            finally
+            {
+                _syncBatch = false;
             }
 
             if (ok == 0 && count > 0)
@@ -194,9 +224,10 @@ public sealed class OpenRgbService : IOpenRgbService
             }
 
             LastError = errors.Count > 0 ? string.Join("; ", errors) : null;
+            var header = $"sync tier {tier}/{EffectSpeedSync.TierCount - 1}";
             LastStatus = notes.Count > 0
-                ? string.Join(" | ", notes)
-                : (ok > 0 ? $"Applied to {ok} device(s)" : null);
+                ? $"{header}: " + string.Join(" | ", notes)
+                : (ok > 0 ? $"{header}: applied to {ok} device(s)" : null);
 
             if (errors.Count > 0 && ok > 0)
                 LastStatus = $"{LastStatus}; partial errors: {LastError}";
@@ -509,13 +540,24 @@ public sealed class OpenRgbService : IOpenRgbService
         {
             appliedMode = found.Mode;
             var speed = MapSpeed01(found.Mode, speed01);
+            var appliedName = found.Mode.Name ?? $"Mode {found.Index}";
             modeNote = UpdateModeProtocol6(deviceIndex, device, found.Index, found.Mode, speed, openRgbColor);
+            if (!EffectModes.NamesMatch(appliedName, modeName) &&
+                !(appliedName.Contains(modeName, StringComparison.OrdinalIgnoreCase) ||
+                  modeName.Contains(appliedName, StringComparison.OrdinalIgnoreCase)))
+            {
+                modeNote = $"{modeNote} [closest for '{modeName}' → '{appliedName}']";
+            }
             wantsPerLedFollowUp = ModeWantsPerLedFollowUp(found.Mode);
         }
         else
         {
             // Fall back to writable Direct/Custom/Static enter (legacy solid path).
             modeNote = EnterWritableMode(deviceIndex, device, openRgbColor, speed01);
+            if (string.IsNullOrEmpty(modeNote))
+                modeNote = $"no mode match for '{modeName}'; Direct/Static fallback";
+            else
+                modeNote = $"{modeNote} [fallback for '{modeName}']";
             appliedMode = device.ActiveMode;
             wantsPerLedFollowUp = true;
             // Refresh after mode enter so LED counts stay accurate.
@@ -524,7 +566,7 @@ public sealed class OpenRgbService : IOpenRgbService
 
         if (!wantsPerLedFollowUp)
         {
-            Thread.Sleep(PostUpdateLedsDelayMs);
+            MaybeInterDeviceDelay();
             return $"{deviceLabel}: {modeNote} (hardware effect, no UpdateLeds)";
         }
 
@@ -547,7 +589,7 @@ public sealed class OpenRgbService : IOpenRgbService
                 Host, Port, Math.Max(_timeoutMs, 2000),
                 deviceIndex, device.Name, zi, protoColors);
 
-            Thread.Sleep(PostUpdateLedsDelayMs);
+            MaybeInterDeviceDelay();
             var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
             return $"{deviceLabel} zone {zi}: {modePart} + proto6 UpdateZoneLeds({ledCount})";
         }
@@ -571,7 +613,7 @@ public sealed class OpenRgbService : IOpenRgbService
                 Host, Port, Math.Max(_timeoutMs, 2000),
                 deviceIndex, device.Name, protoColors);
 
-            Thread.Sleep(PostUpdateLedsDelayMs);
+            MaybeInterDeviceDelay();
             var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
             return $"{deviceLabel}: {modePart} + proto6 UpdateLeds({ledCount})";
         }
@@ -603,20 +645,33 @@ public sealed class OpenRgbService : IOpenRgbService
         return true;
     }
 
-    private static uint MapSpeed01(Mode mode, double speed01)
+    private static uint MapSpeed01(Mode mode, double speed01) =>
+        EffectSpeedSync.MapOpenRgb(
+            mode.SpeedMin,
+            mode.SpeedMax,
+            mode.SupportsSpeed,
+            mode.Speed,
+            speed01);
+
+    /// <summary>Hardware effects with speed benefit from a Sync-all re-assert pass.</summary>
+    private static bool NeedsSpeedReassert(string modeName)
     {
-        speed01 = Math.Clamp(speed01, 0, 1);
-        if (!mode.SupportsSpeed)
-            return mode.Speed;
+        if (string.IsNullOrWhiteSpace(modeName))
+            return false;
+        var n = modeName.Trim();
+        if (n.Contains("Static", StringComparison.OrdinalIgnoreCase) ||
+            n.Contains("Direct", StringComparison.OrdinalIgnoreCase) ||
+            n.Contains("Custom", StringComparison.OrdinalIgnoreCase) ||
+            n.Equals("Off", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return true;
+    }
 
-        var min = mode.SpeedMin;
-        var max = mode.SpeedMax;
-        if (max < min)
-            (min, max) = (max, min);
-        if (max == min)
-            return min;
-
-        return (uint)Math.Round(min + speed01 * (max - min));
+    private void MaybeInterDeviceDelay()
+    {
+        if (_syncBatch)
+            return;
+        Thread.Sleep(PostUpdateLedsDelayMs);
     }
 
     private string UpdateModeProtocol6(
@@ -709,7 +764,66 @@ public sealed class OpenRgbService : IOpenRgbService
                 return (i, m);
         }
 
-        return null;
+        // Closest fallback so Sync all Breathing still does something useful.
+        return FindClosestMode(device, modeName);
+    }
+
+    /// <summary>
+    /// Prefer related effect names, then any speed-capable effect, then Static, then Direct.
+    /// </summary>
+    private static (int Index, Mode Mode)? FindClosestMode(Device device, string modeName)
+    {
+        if (device.Modes is null || device.Modes.Length == 0)
+            return null;
+
+        string[] PreferFor(string requested)
+        {
+            var r = requested.Trim();
+            if (r.Contains("Breath", StringComparison.OrdinalIgnoreCase) ||
+                r.Contains("Fade", StringComparison.OrdinalIgnoreCase) ||
+                r.Contains("Pulse", StringComparison.OrdinalIgnoreCase))
+                return ["Breath", "Fade", "Pulse", "Spectrum", "Cycle", "Wave"];
+            if (r.Contains("Spectrum", StringComparison.OrdinalIgnoreCase) ||
+                r.Contains("Rainbow", StringComparison.OrdinalIgnoreCase) ||
+                r.Contains("Cycle", StringComparison.OrdinalIgnoreCase))
+                return ["Spectrum", "Rainbow", "Cycle", "Wave", "Breath"];
+            if (r.Contains("Wave", StringComparison.OrdinalIgnoreCase))
+                return ["Wave", "Spectrum", "Rainbow", "Breath"];
+            return [];
+        }
+
+        foreach (var needle in PreferFor(modeName))
+        {
+            for (var i = 0; i < device.Modes.Length; i++)
+            {
+                var name = device.Modes[i].Name ?? "";
+                if (name.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                    return (i, device.Modes[i]);
+            }
+        }
+
+        for (var i = 0; i < device.Modes.Length; i++)
+        {
+            if (device.Modes[i].SupportsSpeed)
+                return (i, device.Modes[i]);
+        }
+
+        for (var i = 0; i < device.Modes.Length; i++)
+        {
+            var name = device.Modes[i].Name ?? "";
+            if (name.Contains("Static", StringComparison.OrdinalIgnoreCase))
+                return (i, device.Modes[i]);
+        }
+
+        for (var i = 0; i < device.Modes.Length; i++)
+        {
+            var name = device.Modes[i].Name ?? "";
+            if (name.Contains("Direct", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("Custom", StringComparison.OrdinalIgnoreCase))
+                return (i, device.Modes[i]);
+        }
+
+        return (0, device.Modes[0]);
     }
 
     /// <summary>

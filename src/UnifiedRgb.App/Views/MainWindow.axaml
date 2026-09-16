@@ -137,18 +137,30 @@
 
               <DockPanel>
                 <TextBlock Text="R" Width="56" VerticalAlignment="Center" />
+                <NumericUpDown DockPanel.Dock="Right" Width="78" Margin="8,0,0,0"
+                               Minimum="0" Maximum="255" Increment="1" FormatString="0"
+                               Value="{Binding Red}" />
                 <Slider Minimum="0" Maximum="255" Value="{Binding Red}"
-                        TickFrequency="1" IsSnapToTickEnabled="True" />
+                        TickFrequency="1" IsSnapToTickEnabled="True"
+                        VerticalAlignment="Center" />
               </DockPanel>
               <DockPanel>
                 <TextBlock Text="G" Width="56" VerticalAlignment="Center" />
+                <NumericUpDown DockPanel.Dock="Right" Width="78" Margin="8,0,0,0"
+                               Minimum="0" Maximum="255" Increment="1" FormatString="0"
+                               Value="{Binding Green}" />
                 <Slider Minimum="0" Maximum="255" Value="{Binding Green}"
-                        TickFrequency="1" IsSnapToTickEnabled="True" />
+                        TickFrequency="1" IsSnapToTickEnabled="True"
+                        VerticalAlignment="Center" />
               </DockPanel>
               <DockPanel>
                 <TextBlock Text="B" Width="56" VerticalAlignment="Center" />
+                <NumericUpDown DockPanel.Dock="Right" Width="78" Margin="8,0,0,0"
+                               Minimum="0" Maximum="255" Increment="1" FormatString="0"
+                               Value="{Binding Blue}" />
                 <Slider Minimum="0" Maximum="255" Value="{Binding Blue}"
-                        TickFrequency="1" IsSnapToTickEnabled="True" />
+                        TickFrequency="1" IsSnapToTickEnabled="True"
+                        VerticalAlignment="Center" />
               </DockPanel>
               <DockPanel>
                 <TextBlock Text="Bright %" Width="56" VerticalAlignment="Center" />
@@ -173,11 +185,15 @@
               <DockPanel>
                 <Button DockPanel.Dock="Right" Content="Parse" Margin="8,0,0,0"
                         Command="{Binding ParseHexCommand}" />
-                <TextBox Text="{Binding ColorHex}" Watermark="#RRGGBB" />
+                <TextBox x:Name="ColorHexBox"
+                         Text="{Binding ColorHex, Mode=TwoWay}"
+                         Watermark="#RRGGBB or RRGGBB"
+                         KeyDown="OnColorHexKeyDown"
+                         LostFocus="OnColorHexLostFocus" />
               </DockPanel>
 
               <TextBlock FontSize="11" Opacity="0.65" TextWrapping="Wrap"
-                         Text="Apply sends mode + color + speed. Selected device keeps its own color/mode. Sync all pushes the current global effect to every device. CM Gen2 uses HID hardware modes; others use OpenRGB protocol-6 UpdateMode (+ UpdateLeds for Direct/per-LED Static)." />
+                         Text="Type RGB (0–255) or hex (#RGB / #RRGGBB). Apply sends mode + color + speed. Sync all uses shared speed tiers (CM HID + OpenRGB) with minimal inter-device delay. CM Gen2 stays HID-only; others use protocol-6 UpdateMode (+ UpdateLeds for Direct/per-LED Static)." />
               <Button Content="Apply to selected" Command="{Binding ApplyToSelectedCommand}"
                       HorizontalAlignment="Stretch" IsEnabled="{Binding IsConnected}" />
               <Button Content="Sync all devices" Command="{Binding ApplyToAllCommand}"

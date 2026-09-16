@@ -195,7 +195,7 @@ Mode bytes from OpenRGB `CMARGBGen2A1Controller.h`:
 | Rainbow | `0x08` |
 | Off | `0x09` |
 
-Speed slider **0–100** maps to HID speed `0x00`–`0x04`. Brightness maps to `0x00`–`0xFF`.
+Speed slider **0–100** maps to **5 shared Sync tiers** (0=slow … 4=fast) → HID speed `0x00`–`0x04` (mid ≈ `0x02`). Brightness maps to `0x00`–`0xFF`. See [Speed sync tiers](#speed-sync-tiers).
 
 **Important:** CM Gen2 effects are **HID-only** — do **not** follow with OpenRGB `Direct`/`SetCustomMode`/`UpdateLeds` on this device. Gen2 `SetupDirectMode()` resets the hub and blacks LEDs (~1s flash-then-revert).
 
@@ -214,17 +214,34 @@ OpenRGB.NET remains used for device listing and best-effort mode enter. Color wr
 
 ## Effect modes + speed
 
-Main window **Effect** combo + **Speed** slider (0–100):
+Main window **Effect** combo + **Speed** slider (0–100) + **RGB NumericUpDown** / live **hex** (`#RGB` / `#RRGGBB`):
 
 - Always offers a curated list: Static, Direct, Breathing, Spectrum, Rainbow, Off, Demo, Reload, Recoil, Refill, Fill Flow, Custom.
 - When a device is selected, also lists every mode OpenRGB reports for that controller.
 - **Apply to selected** / **Sync all** send **mode + color + speed** (not solid `UpdateLeds` only).
-- Status line reports which backend ran (e.g. `HID Breathing (mode=0x04, …)` or `proto6 UpdateMode(Spectrum) + proto6 UpdateLeds(n)`).
+- Status line reports which backend ran (e.g. `HID Breathing (mode=0x04, …)` or `proto6 UpdateMode(Spectrum) + proto6 UpdateLeds(n)`), and Sync all lists per-device mode (including closest-mode fallbacks).
+
+### Speed sync tiers
+
+**Sync all matches shared speed tiers, not perfect hardware clocks.** UI 0–100 → discrete tiers 0–4 via `EffectSpeedSync`:
+
+| UI (approx) | Tier | CM HID byte | OpenRGB mapping |
+|-------------|------|-------------|-----------------|
+| 0–12 | 0 (slow) | `0x00` | `SpeedMin` (slow end) |
+| 13–37 | 1 | `0x01` | 25% toward `SpeedMax` |
+| 38–62 | 2 (mid) | `0x02` | midpoint |
+| 63–87 | 3 | `0x03` | 75% toward `SpeedMax` |
+| 88–100 | 4 (fast) | `0x04` | `SpeedMax` (fast end) |
+
+- **CM Gen2 (OpenRGB CMARGBGen2A1):** `SPEED_MIN=0x00` … `SPEED_MAX=0x04` — **higher byte = faster**.
+- **OpenRGB devices (ASRock/GALAX/G502):** map tier into each mode’s `SpeedMin`→`SpeedMax` **without swapping**. ASRock Polychrome USB uses inverted ranges (`SpeedMin=0xFF` slow, `SpeedMax=0x00` fast) — lower byte = faster; we preserve that.
+- **Sync all** skips the usual 50ms inter-device delay so Breathing starts closer in phase, then optionally **re-asserts** the same mode+speed in a second pass. Devices missing the requested mode get the **closest** related effect (or Static/Direct); status lists who got what.
+- Hardware effects (Breathing, Spectrum, …) do **not** get an `UpdateLeds` / Direct follow-up (`ModeWantsPerLedFollowUp`).
 
 ### Non-CM backend
 
-1. Resolve the named mode on the device (exact, then contains).  
-2. `OpenRgbProtocol6Client.UpdateMode` with protocol-6 unique ID and Mode Data (speed mapped from UI 0–100 → `speed_min`/`speed_max`; mode-specific colors filled when required).  
+1. Resolve the named mode on the device (exact, contains, then closest fallback).  
+2. `OpenRgbProtocol6Client.UpdateMode` with protocol-6 unique ID and Mode Data (speed from shared tiers → `speed_min`/`speed_max`; mode-specific colors filled when required).  
 3. If the mode is Direct / Custom / per-LED Static → `UpdateLeds` / `UpdateZoneLeds` with the solid color.  
 4. Pure hardware effects (Breathing, Spectrum, …) stop after `UpdateMode`.
 
@@ -279,7 +296,7 @@ JSON under `%LocalAppData%/UnifiedRgb/profiles/`. Shape:
 
 - Namespace types live in `OpenRGB.NET` (`OpenRgbClient`, `Color`, `Device`, …) — not a separate `Models` namespace in 3.1.1.
 - Prefer `autoConnect: false`, then `Connect()`, so connection failures surface cleanly.
-- Effect flow: for **Cooler Master ARGB Gen2** on Windows, **HID HW_MODE_SETUP** only (Static optionally sent twice ~70ms apart) — never OpenRGB Direct afterward. For **ASRock / GALAX / G502**: protocol-6 unique-ID `UpdateMode` (speed + mode colors), then `UpdateLeds` / `UpdateZoneLeds` when the mode is Direct or per-LED Static. Do not rely on OpenRGB mode API alone for CM Gen2.
+- Effect flow: for **Cooler Master ARGB Gen2** on Windows, **HID HW_MODE_SETUP** only (Static optionally sent twice ~70ms apart) — never OpenRGB Direct afterward. For **ASRock / GALAX / G502**: protocol-6 unique-ID `UpdateMode` (shared speed tiers + mode colors), then `UpdateLeds` / `UpdateZoneLeds` when the mode is Direct or per-LED Static. Sync all uses minimal inter-device delay + optional speed re-assert. Do not rely on OpenRGB mode API alone for CM Gen2.
 - **Protocol 6 unique IDs:** OpenRGB 1.0 SDK returns controller unique IDs (e.g. `[4,5,6,7]`) from `REQUEST_CONTROLLER_COUNT`. This app maps OpenRGB.NET ordinal indices → unique IDs (same list order, preferring name match via `REQUEST_CONTROLLER_DATA`) and sends `UPDATELEDS` (1050) with `pkt_dev_id` = unique ID and `data_size` equal to the full payload.
 - ARGB hubs: call `ResizeZone(deviceId, zoneId, size)` before LEDs exist; zone exposes `LedsMin` / `LedsMax`.
 - **CM Gen2 / missing Edit Zone:** `ResizeZone` is a no-op without `ZONE_FLAG_MANUALLY_CONFIGURABLE_SIZE`. OpenRGB.NET 3.1.1 max protocol is **4** (`CommandId` has no 1003; `OpenRgbConnection.Send` is internal). This app therefore uses a dedicated raw TCP path that negotiates protocol 6 and sends ConfigureZone; it does **not** inject packets into OpenRGB.NET’s socket (the server would parse Zone Data as protocol 4, dropping flags).
