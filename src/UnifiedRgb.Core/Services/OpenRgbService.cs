@@ -108,7 +108,7 @@ public sealed class OpenRgbService : IOpenRgbService
             EnsureConnected();
             try
             {
-                var note = ApplyToDevice(_client!, deviceIndex, color, brightness01);
+                var note = ApplyToDevice(deviceIndex, color, brightness01);
                 LastError = null;
                 LastStatus = note;
             }
@@ -153,7 +153,7 @@ public sealed class OpenRgbService : IOpenRgbService
             {
                 try
                 {
-                    var note = ApplyToDevice(_client!, i, color, brightness01);
+                    var note = ApplyToDevice(i, color, brightness01);
                     ok++;
                     if (!string.IsNullOrWhiteSpace(note))
                         notes.Add(note);
@@ -196,7 +196,7 @@ public sealed class OpenRgbService : IOpenRgbService
             EnsureConnected();
             try
             {
-                var note = ApplyToZone(_client!, deviceIndex, zoneIndex, color, brightness01);
+                var note = ApplyToZone(deviceIndex, zoneIndex, color, brightness01);
                 LastError = null;
                 LastStatus = note;
             }
@@ -308,6 +308,10 @@ public sealed class OpenRgbService : IOpenRgbService
 
     private void ConfigureZoneLocked(int deviceIndex, int zoneIndex, int ledCount, Zone zone)
     {
+        string? deviceName = null;
+        try { deviceName = _client!.GetControllerData(deviceIndex).Name; }
+        catch { /* name match is best-effort */ }
+
         OpenRgbConfigureZoneClient.ConfigureZone(
             Host,
             Port,
@@ -323,7 +327,8 @@ public sealed class OpenRgbService : IOpenRgbService
                 LedsCount = (uint)ledCount,
                 Flags = OpenRgbConfigureZoneClient.ZoneFlagManuallyConfigurableSize
                       | OpenRgbConfigureZoneClient.ZoneFlagManuallyConfiguredSize
-            });
+            },
+            preferredDeviceName: deviceName);
 
         var verify = _client!.GetControllerData(deviceIndex);
         if (zoneIndex >= verify.Zones.Length)
@@ -390,8 +395,9 @@ public sealed class OpenRgbService : IOpenRgbService
         }
     }
 
-    private static string ApplyToDevice(OpenRgbClient client, int deviceIndex, RgbColor color, double brightness01)
+    private string ApplyToDevice(int deviceIndex, RgbColor color, double brightness01)
     {
+        var client = _client!;
         var device = client.GetControllerData(deviceIndex);
         var scaled = color.WithBrightness(brightness01);
         var deviceLabel = device.Name ?? $"Device {deviceIndex}";
@@ -399,6 +405,7 @@ public sealed class OpenRgbService : IOpenRgbService
         // Cooler Master ARGB Gen2: OpenRGB set_mode/UpdateLeds often leaves Spectrum.
         // Drive solid color via Windows HID Static only — never follow with OpenRGB Direct
         // (SetupDirectMode ResetDevice + black LEDs fights HID Static ~1s later).
+        // CM path is HID-only; do not treat ASRock/GALAX/G502 like CM.
         if (TryApplyCmGen2HidStatic(device.Name, scaled))
         {
             // Optional second HID Static for stickiness; still no OpenRGB sync.
@@ -407,10 +414,15 @@ public sealed class OpenRgbService : IOpenRgbService
             return $"{deviceLabel}: HID Static x2 (no OpenRGB follow-up)";
         }
 
+        // Non-CM backends (each device has its own stack — not CM HID):
+        // - ASRock: no Direct; Static is per-LED (color_mode PER_LED) — UpdateLeds all LEDs
+        // - GALAX: Direct + UpdateLeds (typically 1 LED)
+        // - G502: Direct + UpdateLeds; quit Logitech G HUB (conflicts)
+        // OpenRGB.NET 3.1.1 speaks protocol 4 and sends ordinal indices for UpdateLeds;
+        // protocol-6 servers use unique IDs — always apply colors via proto6 unique-ID path.
         var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
         var modeNote = EnterWritableMode(client, deviceIndex, device, openRgbColor);
 
-        // Static/mode-specific color was applied via UpdateMode; still push LEDs when present.
         var ledCount = device.Leds.Length;
         if (ledCount == 0)
         {
@@ -421,17 +433,23 @@ public sealed class OpenRgbService : IOpenRgbService
                 : $"{deviceLabel}: {modeNote}; skipped UpdateLeds (LedCount==0)";
         }
 
-        var colors = new Color[ledCount];
-        Array.Fill(colors, openRgbColor);
-        client.UpdateLeds(deviceIndex, colors);
+        var protoColors = new (byte R, byte G, byte B)[ledCount];
+        for (var i = 0; i < ledCount; i++)
+            protoColors[i] = (scaled.R, scaled.G, scaled.B);
+
+        OpenRgbProtocol6Client.UpdateLeds(
+            Host, Port, Math.Max(_timeoutMs, 2000),
+            deviceIndex, device.Name, protoColors);
+
         // Slow SMBus/USB devices (ASRock, GPU, mouse) often need a beat before the next controller.
         Thread.Sleep(PostUpdateLedsDelayMs);
         var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
-        return $"{deviceLabel}: {modePart} + UpdateLeds({ledCount})";
+        return $"{deviceLabel}: {modePart} + proto6 UpdateLeds({ledCount})";
     }
 
-    private static string ApplyToZone(OpenRgbClient client, int deviceIndex, int zoneIndex, RgbColor color, double brightness01)
+    private string ApplyToZone(int deviceIndex, int zoneIndex, RgbColor color, double brightness01)
     {
+        var client = _client!;
         var device = client.GetControllerData(deviceIndex);
         if (zoneIndex < 0 || zoneIndex >= device.Zones.Length)
             throw new ArgumentOutOfRangeException(nameof(zoneIndex), $"Zone {zoneIndex} is out of range.");
@@ -447,6 +465,7 @@ public sealed class OpenRgbService : IOpenRgbService
             return $"{deviceLabel}: HID Static x2 (no OpenRGB follow-up)";
         }
 
+        // Non-CM: mode enter best-effort via OpenRGB.NET, colors always via proto6 unique IDs.
         var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
         var modeNote = EnterWritableMode(client, deviceIndex, device, openRgbColor);
 
@@ -461,12 +480,17 @@ public sealed class OpenRgbService : IOpenRgbService
                 : $"{deviceLabel} zone {zoneIndex}: {modeNote}; skipped UpdateZoneLeds (LedCount==0)";
         }
 
-        var colors = new Color[ledCount];
-        Array.Fill(colors, openRgbColor);
-        client.UpdateZoneLeds(deviceIndex, zoneIndex, colors);
+        var protoColors = new (byte R, byte G, byte B)[ledCount];
+        for (var i = 0; i < ledCount; i++)
+            protoColors[i] = (scaled.R, scaled.G, scaled.B);
+
+        OpenRgbProtocol6Client.UpdateZoneLeds(
+            Host, Port, Math.Max(_timeoutMs, 2000),
+            deviceIndex, device.Name, zoneIndex, protoColors);
+
         Thread.Sleep(PostUpdateLedsDelayMs);
         var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
-        return $"{deviceLabel} zone {zoneIndex}: {modePart} + UpdateZoneLeds({ledCount})";
+        return $"{deviceLabel} zone {zoneIndex}: {modePart} + proto6 UpdateZoneLeds({ledCount})";
     }
 
     /// <summary>
@@ -495,9 +519,10 @@ public sealed class OpenRgbService : IOpenRgbService
 
     /// <summary>
     /// Enter a writable lighting mode for Apply-to-selected (one device at a time).
-    /// Order matches hardware needs: Direct (GALAX/G502) → Custom → SetCustomMode →
-    /// Static with mode colors (ASRock). UpdateLeds alone is not enough for Static
-    /// mode-specific controllers. Returns a short note for LastStatus.
+    /// Best-effort via OpenRGB.NET (protocol 4 ordinals); colors are applied afterward
+    /// via protocol-6 unique-ID UpdateLeds. Order: Direct (GALAX/G502) → Custom →
+    /// SetCustomMode → Static (ASRock — no Direct; Static is often PER_LED).
+    /// Returns a short note for LastStatus.
     /// </summary>
     private static string EnterWritableMode(
         OpenRgbClient client, int deviceIndex, Device device, Color solidColor)

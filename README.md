@@ -10,6 +10,7 @@ Windows desktop MVP for Marcus Lee’s unified RGB controller. Talks **only** to
    - GALAX / KFA2 Xtreme Tuner  
    - Cooler Master MasterPlus+  
    - ASRock Polychrome Sync  
+   - **Logitech G HUB** (required for G502 — G HUB fights OpenRGB for the mouse)  
 4. **.NET 8 SDK** (or run a published build).
 
 This client does **not** install OpenRGB and does **not** require Administrator rights itself.
@@ -18,10 +19,10 @@ This client does **not** install OpenRGB and does **not** require Administrator 
 
 | Gear | Notes |
 |------|--------|
-| GALAX RTX 2070 Super | GPU SMBus RGB via OpenRGB Galax detector; needs PawnIO |
-| Cooler Master ARGB Gen2 A1 V2 | USB HID (VID `0x2516` / PID `0x01C9`); quit MasterPlus+ first. Channels often report **0 LEDs** — use **ConfigureZone** for size. **Solid color** uses raw **HID Static** (not OpenRGB `set_mode` alone — that ACKs but can leave Spectrum/rainbow). |
-| ASRock B450 Steel Legend | Polychrome (SMBus or USB depending on board revision) |
-| Logitech G502 | Often detected as a mouse device in OpenRGB |
+| GALAX RTX 2070 Super | GPU SMBus RGB via OpenRGB Galax detector; needs PawnIO. Backend: OpenRGB **protocol 6** Direct + `UpdateLeds` (unique ID). |
+| Cooler Master ARGB Gen2 A1 V2 | USB HID (VID `0x2516` / PID `0x01C9`); quit MasterPlus+ first. Channels often report **0 LEDs** — use **ConfigureZone** for size. **Solid color** uses raw **HID Static** only (not OpenRGB). |
+| ASRock B450 Steel Legend | Polychrome (SMBus or USB). No Direct mode — Static is per-LED (`color_mode` PER_LED). Backend: OpenRGB **protocol 6** Static + `UpdateLeds` (unique ID). |
+| Logitech G502 | Mouse in OpenRGB. **Quit G HUB** first. Backend: OpenRGB **protocol 6** Direct + `UpdateLeds` (unique ID). |
 
 Exact OpenRGB names vary; use **Refresh** after connecting.
 
@@ -56,7 +57,7 @@ On Windows, start OpenRGB → **SDK Server** → **Start Server**, then click **
 1. Connect to OpenRGB SDK  
 2. List devices (name, zones, LED counts, mode)  
 3. **Channel/zone picker** + **LED count** + **Apply size** for ARGB controllers that start at 0 LEDs (CM MasterPlus+/ARGB Gen2 A1 V2). Tries `ResizeZone`, then **ConfigureZone** (SDK packet 1003) so CM works without OpenRGB’s Edit Zone  
-4. Color picker → apply solid color to **selected** device/zone or **sync all** (CM Gen2 → Windows **HID Static**; other devices → OpenRGB.NET)  
+4. Color picker → apply solid color to **selected** device/zone or **sync all** (CM Gen2 → Windows **HID Static**; ASRock/GALAX/G502 → OpenRGB **protocol 6** unique-ID `UpdateLeds`)  
 5. When applying to a selected zone with `LedCount == 0`, the app **auto-applies size** to the UI LED count (default **24**) then `UpdateZoneLeds`  
 6. Brightness: client-side RGB scaling (see API quirk below)  
 7. Save / load / delete named profiles as JSON under  
@@ -85,7 +86,18 @@ OpenRGB `UpdateMode` / Direct often **ACKs OK** but fans stay on Spectrum/rainbo
 
 **Important:** CM Gen2 color is **HID-only** — do **not** follow HID Static with OpenRGB `Direct`/`SetCustomMode`/`UpdateLeds` on this device. Gen2 `SetupDirectMode()` resets the hub and blacks LEDs, which looks like a ~1s flash-then-revert after Apply.
 
-Other devices keep the normal OpenRGB.NET path: enter Direct/Custom (or Static with mode colors via `UpdateMode`), then `UpdateLeds` / `UpdateZoneLeds`. Per-LED Direct channel colors on CM Gen2 remain future work.
+Other devices use **per-device OpenRGB protocol-6 backends** (not CM HID): mode enter best-effort via OpenRGB.NET, then colors via raw TCP `UpdateLeds` / `UpdateZoneLeds` with **unique controller IDs**. Per-LED Direct channel colors on CM Gen2 remain future work.
+
+## Per-device Apply backends
+
+| Device | Backend | Notes |
+|--------|---------|--------|
+| Cooler Master ARGB Gen2 | Windows **HID Static** only | Never follow with OpenRGB Direct/`UpdateLeds` |
+| ASRock Polychrome | OpenRGB protocol 6 | No Direct; Static is PER_LED — `UpdateLeds` all zone LEDs |
+| GALAX GPU | OpenRGB protocol 6 | Direct + `UpdateLeds` (often 1 LED) |
+| Logitech G502 | OpenRGB protocol 6 | Direct + `UpdateLeds`; **quit G HUB** |
+
+OpenRGB.NET remains used for device listing and best-effort mode enter. Color writes for non-CM devices go through `OpenRgbProtocol6Client`.
 
 ## Packages
 
@@ -100,7 +112,8 @@ Other devices keep the normal OpenRGB.NET path: enter Direct/Custom (or Static w
 
 - Namespace types live in `OpenRGB.NET` (`OpenRgbClient`, `Color`, `Device`, …) — not a separate `Models` namespace in 3.1.1.
 - Prefer `autoConnect: false`, then `Connect()`, so connection failures surface cleanly.
-- Solid color flow: for **Cooler Master ARGB Gen2** on Windows, **HID Static only** (optionally sent twice ~70ms apart) — never OpenRGB Direct afterward. Otherwise: `SetCustomMode` or `UpdateMode(Direct/Custom/Static)` with mode colors when needed, then `UpdateLeds` / `UpdateZoneLeds` (+ short delay). Do not rely on OpenRGB mode API alone to leave Spectrum on CM Gen2.
+- Solid color flow: for **Cooler Master ARGB Gen2** on Windows, **HID Static only** (optionally sent twice ~70ms apart) — never OpenRGB Direct afterward. For **ASRock / GALAX / G502**: enter Direct/Custom/Static best-effort via OpenRGB.NET, then **always** apply colors with protocol-6 unique-ID `UpdateLeds` / `UpdateZoneLeds` (OpenRGB.NET 3.1.1 protocol 4 ordinals are ignored / mis-target on protocol-6 servers). Do not rely on OpenRGB mode API alone to leave Spectrum on CM Gen2.
+- **Protocol 6 unique IDs:** OpenRGB 1.0 SDK returns controller unique IDs (e.g. `[4,5,6,7]`) from `REQUEST_CONTROLLER_COUNT`. This app maps OpenRGB.NET ordinal indices → unique IDs (same list order, preferring name match via `REQUEST_CONTROLLER_DATA`) and sends `UPDATELEDS` (1050) with `pkt_dev_id` = unique ID and `data_size` equal to the full payload.
 - ARGB hubs: call `ResizeZone(deviceId, zoneId, size)` before LEDs exist; zone exposes `LedsMin` / `LedsMax`.
 - **CM Gen2 / missing Edit Zone:** `ResizeZone` is a no-op without `ZONE_FLAG_MANUALLY_CONFIGURABLE_SIZE`. OpenRGB.NET 3.1.1 max protocol is **4** (`CommandId` has no 1003; `OpenRgbConnection.Send` is internal). This app therefore uses a dedicated raw TCP path that negotiates protocol 6 and sends ConfigureZone; it does **not** inject packets into OpenRGB.NET’s socket (the server would parse Zone Data as protocol 4, dropping flags).
 - **Brightness:** `Mode.SupportsBrightness` / `SetBrightness` exist, but `UpdateMode` **re-fetches** the device and only applies optional `speed` / `direction` / `colors`. There is **no brightness parameter**, so hardware brightness cannot be set through the public API. This app scales RGB client-side instead.
