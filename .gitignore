@@ -57,3 +57,9 @@ Desktop.ini
 ## Local profiles / secrets (none expected)
 *.env
 secrets.json
+
+## Publish artifacts (keep dist/README.md)
+dist/win-x64/
+dist/*.zip
+dist/Install-UnifiedRgb.ps1
+dist/Uninstall-UnifiedRgb.ps1

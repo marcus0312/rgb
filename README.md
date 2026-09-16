@@ -1,17 +1,15 @@
 # Unified RGB
 
-Windows desktop MVP for Marcus Lee’s unified RGB controller. Talks **only** to a local [OpenRGB](https://openrgb.org/) SDK server via **OpenRGB.NET** — no vendor RGB apps, no proprietary DLLs.
+Windows desktop RGB controller for Marcus Lee. Talks **only** to a local [OpenRGB](https://openrgb.org/) SDK server via **OpenRGB.NET** (+ CM Gen2 HID Static / protocol-6 backends) — no vendor RGB apps, no proprietary DLLs.
+
+**Phase 3:** installable win-x64 build, Start with Windows, system tray, settings persistence, vendor-conflict warnings.
 
 ## Prerequisites (Windows PC)
 
 1. **OpenRGB 1.0+** with **SDK Server** enabled (default `127.0.0.1:6742`).
-2. **PawnIO** (or equivalent OpenRGB kernel helper) installed when devices need SMBus/I²C (GPU / some motherboard paths). OpenRGB’s installer/docs cover this.
-3. Close or disable conflicting vendor software so OpenRGB can claim devices:
-   - GALAX / KFA2 Xtreme Tuner  
-   - Cooler Master MasterPlus+  
-   - ASRock Polychrome Sync  
-   - **Logitech G HUB** (required for G502 — G HUB fights OpenRGB for the mouse)  
-4. **.NET 8 SDK** (or run a published build).
+2. **PawnIO** (or equivalent OpenRGB kernel helper) when devices need SMBus/I²C (GPU / some motherboard paths).
+3. Close conflicting vendor software (see [Vendor conflict runbook](#vendor-conflict-runbook)).
+4. **.NET 8 SDK** only if you build from source; the published self-contained build does not need a machine-wide runtime.
 
 This client does **not** install OpenRGB and does **not** require Administrator rights itself.
 
@@ -31,11 +29,14 @@ Exact OpenRGB names vary; use **Refresh** after connecting.
 ```
 marcus0312-rgb/
   UnifiedRgb.sln
-  src/UnifiedRgb.Core/     # OpenRGB service, CM Gen2 HID Static, JSON profiles
-  src/UnifiedRgb.App/      # Avalonia desktop UI
+  src/UnifiedRgb.Core/     # OpenRGB, CM HID, profiles, settings, autostart, vendor checks
+  src/UnifiedRgb.App/      # Avalonia desktop UI + tray
+  installer/               # PowerShell Install / Uninstall
+  scripts/publish-win-x64.sh
+  dist/                    # publish output (after script)
 ```
 
-## How to run
+## How to run (dev)
 
 ```bash
 cd marcus0312-rgb
@@ -44,27 +45,122 @@ dotnet build
 dotnet run --project src/UnifiedRgb.App
 ```
 
-On Windows, start OpenRGB → **SDK Server** → **Start Server**, then click **Connect** in the app (defaults `127.0.0.1:6742`).
+On Windows, start OpenRGB → **SDK Server** → **Start Server**, then click **Connect** (defaults `127.0.0.1:6742`). On launch the app also **retries connect** automatically and can **auto-apply the last profile**.
 
 ### Connect notes
 
-- Host/port are configurable in the UI.
+- Host/port are configurable in the UI and persisted in settings JSON.
 - If the server is down, status shows a clear error and the device list clears.
 - After connect, **Refresh** reloads controllers (name, zones, LED counts, active mode).
 
-## Features (MVP)
+## Install (Windows)
 
-1. Connect to OpenRGB SDK  
+Preferred path from this Linux CI/box: **self-contained win-x64 publish + PowerShell installer** (no Inno/Velopack cross-compile).
+
+### 1. Publish (Linux or Windows)
+
+```bash
+./scripts/publish-win-x64.sh
+```
+
+Produces:
+
+| Artifact | Purpose |
+|----------|---------|
+| `dist/win-x64/` | Self-contained folder with `UnifiedRgb.App.exe` |
+| `dist/UnifiedRgb-win-x64.zip` | Zip of publish + install scripts |
+| `dist/Install-UnifiedRgb.ps1` | Copied installer for convenience |
+
+### 2. Install on the Windows PC
+
+Copy the zip (or `dist/` folder) to the PC, then in PowerShell:
+
+```powershell
+Expand-Archive .\UnifiedRgb-win-x64.zip -DestinationPath .\UnifiedRgb-setup
+cd .\UnifiedRgb-setup
+powershell -ExecutionPolicy Bypass -File .\Install-UnifiedRgb.ps1 -SourceDir .\win-x64
+```
+
+What the installer does:
+
+- Copies to `%LocalAppData%\Programs\UnifiedRgb\`
+- Creates Start Menu shortcut **Unified RGB**
+- Registers **HKCU** uninstall entry + `Uninstall.ps1`
+- Registers **Start with Windows** via `HKCU\...\Run\UnifiedRgb` (default ON; pass `-StartWithWindows:$false` to skip)
+
+Uninstall:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "%LocalAppData%\Programs\UnifiedRgb\Uninstall.ps1"
+```
+
+Profiles/settings under `%LocalAppData%\UnifiedRgb\` are kept.
+
+### Optional: Inno Setup / Velopack (Windows-only)
+
+If you want a classic `.exe` setup later, run the same `dotnet publish -r win-x64 --self-contained` on Windows and point Inno Setup / Velopack at `dist/win-x64`. This repo ships the zip+PowerShell path because it builds cleanly from Linux.
+
+## Auto-launch on login
+
+- UI checkbox **Start with Windows** (default **ON** for installed builds under `LocalAppData\Programs\UnifiedRgb` or when `installed.marker` is present).
+- Implementation: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value `UnifiedRgb` → quoted path to `UnifiedRgb.App.exe` (adds `--minimized` when **Start minimized** is on).
+- On startup the app waits/retries OpenRGB at the configured host/port (default `127.0.0.1:6742`), then **auto-applies the last-used profile** when **Auto-apply last profile on launch** is enabled.
+
+## System tray
+
+- Avalonia 11 built-in `TrayIcon` (Windows).
+- **Close to tray** (default ON): closing the window hides to tray instead of exiting.
+- **Start minimized**: starts in tray (also via `--minimized` CLI flag used by autostart).
+- Tray menu: **Show**, **Sync all** (last profile if set, else current color), **Load profile** submenu, **Exit**.
+
+## Settings
+
+Persisted at `%LocalAppData%/UnifiedRgb/settings.json`:
+
+| Key | Meaning |
+|-----|---------|
+| `host` / `port` | OpenRGB SDK endpoint |
+| `startWithWindows` | HKCU Run registration |
+| `startMinimized` | Launch hidden to tray |
+| `closeToTray` | Close button → tray |
+| `lastProfileName` | Last saved/loaded/applied profile |
+| `autoApplyOnLaunch` | After connect on startup, apply last profile |
+
+Profiles remain under `%LocalAppData%/UnifiedRgb/profiles/`.
+
+## Vendor conflict runbook
+
+Vendor RGB suites often hold exclusive access to the same USB/SMBus devices OpenRGB needs. **Quit them before connecting** (or leave them closed at login if you rely on autostart).
+
+| Process / product | Why it conflicts |
+|-------------------|------------------|
+| **Logitech G HUB** (`lghub`, agents) | Fights OpenRGB for G502 / Logitech HID |
+| **Cooler Master MasterPlus+** (`MasterPlus`, `MPIV`) | Claims CM ARGB Gen2 hub |
+| **ASRock Polychrome Sync** (`Polychrome*`) | Claims motherboard RGB |
+| **GALAX / KFA2 Xtreme Tuner** / GALAX RGB | Claims GALAX GPU RGB |
+
+**Checklist**
+
+1. Exit G HUB from its tray icon (not just close the window).
+2. Exit MasterPlus+, Polychrome Sync, Xtreme Tuner / GALAX RGB the same way.
+3. Start **OpenRGB** → enable **SDK Server** on `127.0.0.1:6742`.
+4. Optional: run OpenRGB as a Windows service / scheduled task so it is up before Unified RGB autostart (Unified RGB will retry for ~30s either way).
+5. Launch **Unified RGB** — if a conflict is still running, a **non-blocking amber banner** and status text warn you (devices may be missing until you quit the vendor app and **Refresh**).
+
+This app never kills vendor processes for you; it only detects and warns.
+
+## Features
+
+1. Connect to OpenRGB SDK (manual + startup retry)  
 2. List devices (name, zones, LED counts, mode)  
-3. **Channel/zone picker** + **LED count** + **Apply size** for ARGB controllers that start at 0 LEDs (CM MasterPlus+/ARGB Gen2 A1 V2). Tries `ResizeZone`, then **ConfigureZone** (SDK packet 1003) so CM works without OpenRGB’s Edit Zone  
+3. **Channel/zone picker** + **LED count** + **Apply size** (ResizeZone / ConfigureZone for CM Gen2)  
 4. Color picker → apply solid color to **selected** device/zone or **sync all** (CM Gen2 → Windows **HID Static**; ASRock/GALAX/G502 → OpenRGB **protocol 6** unique-ID `UpdateLeds`)  
-5. When applying to a selected zone with `LedCount == 0`, the app **auto-applies size** to the UI LED count (default **24**) then `UpdateZoneLeds`  
-6. Brightness: client-side RGB scaling (see API quirk below)  
-7. Save / load / delete named profiles as JSON under  
-   `%LocalAppData%/UnifiedRgb/profiles/`  
-8. Clear connection status / errors when the server is unavailable  
+5. When applying to a selected zone with `LedCount == 0`, auto-applies size (default **24**) then zone LEDs  
+6. Brightness: client-side RGB scaling  
+7. Save / load / delete named profiles (JSON)  
+8. **Install + Start with Windows + tray + settings + vendor warnings** (Phase 3)
 
-Out of scope: music sync, effect engines, hardware reverse engineering, installing OpenRGB.
+Out of scope (this PR): music sync, full effect engine canvas, bundling/installing OpenRGB, fan curves.
 
 ## Cooler Master ARGB Gen2 (size + color)
 
@@ -103,9 +199,10 @@ OpenRGB.NET remains used for device listing and best-effort mode enter. Color wr
 
 | Package | Version | Role |
 |---------|---------|------|
-| OpenRGB.NET | 3.1.1 | OpenRGB SDK client ([nuget.org](https://www.nuget.org/packages/OpenRGB.NET)) |
-| HidSharp | 2.1.0 | Windows HID Static for Cooler Master ARGB Gen2 solid color |
-| Avalonia (+ Desktop, Fluent, Inter) | 11.2.5 | Cross-platform desktop UI (pinned to 11.x for .NET 8 SDK Roslyn) |
+| OpenRGB.NET | 3.1.1 | OpenRGB SDK client |
+| HidSharp | 2.1.0 | Windows HID Static for Cooler Master ARGB Gen2 |
+| Microsoft.Win32.Registry | 5.0.0 | HKCU Run autostart (Windows) |
+| Avalonia (+ Desktop, Fluent, Inter) | 11.2.5 | Desktop UI + built-in TrayIcon |
 | CommunityToolkit.Mvvm | 8.x | MVVM helpers |
 
 ## OpenRGB.NET API quirks
