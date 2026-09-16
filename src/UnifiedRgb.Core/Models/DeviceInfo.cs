@@ -24,10 +24,15 @@ public sealed class DeviceInfo
     public int LedCount { get; init; }
     public string? ActiveModeName { get; init; }
     public bool ActiveModeSupportsBrightness { get; init; }
+    public bool ActiveModeSupportsSpeed { get; init; }
     public uint? Brightness { get; init; }
     public uint? BrightnessMin { get; init; }
     public uint? BrightnessMax { get; init; }
+    public uint? Speed { get; init; }
+    public uint? SpeedMin { get; init; }
+    public uint? SpeedMax { get; init; }
     public IReadOnlyList<ZoneInfo> Zones { get; init; } = Array.Empty<ZoneInfo>();
+    public IReadOnlyList<ModeInfo> Modes { get; init; } = Array.Empty<ModeInfo>();
     public RgbColor? CurrentColor { get; init; }
 
     public string ZonesSummary =>

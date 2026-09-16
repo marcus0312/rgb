@@ -175,6 +175,67 @@ internal static class OpenRgbProtocol6Client
         return payload;
     }
 
+    /// <summary>
+    /// Serialize Mode Data for protocol 6+ (mode_value omitted). Used by UPDATEMODE (1101).
+    /// </summary>
+    public static byte[] BuildModeDataProtocol6(
+        string modeName,
+        uint flags,
+        uint speedMin,
+        uint speedMax,
+        uint brightnessMin,
+        uint brightnessMax,
+        uint colorsMin,
+        uint colorsMax,
+        uint speed,
+        uint brightness,
+        uint direction,
+        uint colorMode,
+        ReadOnlySpan<(byte R, byte G, byte B)> colors)
+    {
+        var nameRaw = Encoding.UTF8.GetBytes(modeName ?? "");
+        var nameWithNul = new byte[nameRaw.Length + 1];
+        Buffer.BlockCopy(nameRaw, 0, nameWithNul, 0, nameRaw.Length);
+
+        var len = 2 + nameWithNul.Length
+                  + 4 // flags
+                  + 4 + 4 // speed min/max
+                  + 4 + 4 // brightness min/max (protocol >= 3)
+                  + 4 + 4 // colors min/max
+                  + 4 // speed
+                  + 4 // brightness
+                  + 4 // direction
+                  + 4 // color_mode
+                  + 2 // num_colors
+                  + (4 * colors.Length);
+
+        var buf = new byte[len];
+        var o = 0;
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(o, 2), (ushort)nameWithNul.Length);
+        o += 2;
+        Buffer.BlockCopy(nameWithNul, 0, buf, o, nameWithNul.Length);
+        o += nameWithNul.Length;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), flags); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), speedMin); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), speedMax); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), brightnessMin); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), brightnessMax); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), colorsMin); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), colorsMax); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), speed); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), brightness); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), direction); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o, 4), colorMode); o += 4;
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(o, 2), (ushort)colors.Length); o += 2;
+        for (var i = 0; i < colors.Length; i++)
+        {
+            WriteRgbColor(buf.AsSpan(o, 4), colors[i]);
+            o += 4;
+        }
+
+        return buf;
+    }
+
     private static void WriteRgbColor(Span<byte> dest, (byte R, byte G, byte B) color)
     {
         // OpenRGB RGBColor: low byte R, then G, B, pad (little-endian uint32).

@@ -26,6 +26,10 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     private bool _suppressSettingsPersist;
     private CancellationTokenSource? _startupCts;
     private bool _startupFlowStarted;
+    private bool _suppressDeviceEffectSync;
+    private string? _effectStateDeviceKey;
+    private readonly Dictionary<string, DeviceEffectState> _deviceEffects =
+        new(StringComparer.OrdinalIgnoreCase);
 
     [ObservableProperty] private string _host = "127.0.0.1";
     [ObservableProperty] private string _portText = "6742";
@@ -40,6 +44,9 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private int _green;
     [ObservableProperty] private int _blue;
     [ObservableProperty] private double _brightness = 100;
+    [ObservableProperty] private string? _selectedEffectMode = "Static";
+    [ObservableProperty] private double _effectSpeed = 50;
+    [ObservableProperty] private bool _effectSpeedEnabled = true;
     [ObservableProperty] private string _profileName = "My Profile";
     [ObservableProperty] private string? _selectedProfileName;
     [ObservableProperty] private string _colorHex = "#FF0000";
@@ -51,6 +58,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     public ObservableCollection<DeviceInfo> Devices { get; } = new();
     public ObservableCollection<ZoneInfo> Zones { get; } = new();
     public ObservableCollection<string> ProfileNames { get; } = new();
+    public ObservableCollection<string> EffectModeOptions { get; } = new();
 
     public IBrush PreviewBrush => new SolidColorBrush(Color.FromRgb((byte)Red, (byte)Green, (byte)Blue));
 
@@ -112,6 +120,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         _openRgb.ConnectionChanged += OnConnectionChanged;
         RefreshProfileList();
         RefreshVendorConflicts();
+        RebuildEffectModeOptions(null);
     }
 
     /// <summary>Call once after the UI is ready — connect with retry and auto-apply last profile.</summary>
@@ -144,7 +153,19 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     partial void OnVendorConflictWarningChanged(string? value) =>
         OnPropertyChanged(nameof(HasVendorConflict));
 
-    partial void OnSelectedDeviceChanged(DeviceInfo? value) => PopulateZonesFromDevice(value);
+    partial void OnSelectedDeviceChanged(DeviceInfo? value)
+    {
+        if (!_suppressDeviceEffectSync)
+            PersistCurrentDeviceEffectState();
+
+        PopulateZonesFromDevice(value);
+        RebuildEffectModeOptions(value);
+
+        if (!_suppressDeviceEffectSync)
+            LoadDeviceEffectState(value);
+    }
+
+    partial void OnSelectedEffectModeChanged(string? value) => UpdateEffectSpeedEnabled();
 
     partial void OnSelectedZoneChanged(ZoneInfo? value)
     {
@@ -465,6 +486,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
             OnPropertyChanged(nameof(ZoneLimitsHint));
             RefreshVendorConflicts();
+            RebuildEffectModeOptions(SelectedDevice);
 
             var baseStatus = Devices.Count == 0
                 ? "Connected — no devices detected. Check OpenRGB device list / PawnIO / close vendor RGB apps."
@@ -546,8 +568,12 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         {
             var color = CurrentColor();
             var bright = Brightness / 100.0;
+            var speed = EffectSpeed / 100.0;
+            var mode = SelectedEffectMode ?? "Static";
             var deviceIndex = SelectedDevice.Index;
             var deviceName = SelectedDevice.Name;
+
+            RememberDeviceEffect(deviceName, color, mode, EffectSpeed, Brightness);
 
             if (SelectedZone is not null)
             {
@@ -561,17 +587,18 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                     if (ledCount == 0)
                         _openRgb.ResizeZone(deviceIndex, zoneIndex, desiredSize);
 
-                    _openRgb.ApplySolidColorToZone(deviceIndex, zoneIndex, color, bright);
+                    _openRgb.ApplyEffectToZone(deviceIndex, zoneIndex, color, mode, speed, bright);
                 });
 
                 StatusText = AppendLastStatus(ledCount == 0
-                    ? $"Resized \"{zoneName}\" to {desiredSize} then applied {color.ToHex()} @ {Brightness:0}%."
-                    : $"Applied {color.ToHex()} @ {Brightness:0}% to zone \"{zoneName}\" on {deviceName}.");
+                    ? $"Resized \"{zoneName}\" to {desiredSize} then applied {mode} {color.ToHex()} @ {Brightness:0}% speed {EffectSpeed:0}."
+                    : $"Applied {mode} {color.ToHex()} @ {Brightness:0}% (speed {EffectSpeed:0}) to zone \"{zoneName}\" on {deviceName}.");
             }
             else
             {
-                await Task.Run(() => _openRgb.ApplySolidColor(deviceIndex, color, bright));
-                StatusText = AppendLastStatus($"Applied {color.ToHex()} @ {Brightness:0}% to {deviceName}.");
+                await Task.Run(() => _openRgb.ApplyEffect(deviceIndex, color, mode, speed, bright));
+                StatusText = AppendLastStatus(
+                    $"Applied {mode} {color.ToHex()} @ {Brightness:0}% (speed {EffectSpeed:0}) to {deviceName}.");
             }
 
             await RefreshDevicesAsync();
@@ -586,6 +613,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             IsBusy = false;
         }
     }
+
 
     [RelayCommand]
     private async Task ApplyToAllAsync()
@@ -601,8 +629,16 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         {
             var color = CurrentColor();
             var bright = Brightness / 100.0;
-            await Task.Run(() => _openRgb.ApplySolidColorToAll(color, bright));
-            StatusText = AppendLastStatus($"Synced {color.ToHex()} @ {Brightness:0}% to all devices.");
+            var speed = EffectSpeed / 100.0;
+            var mode = SelectedEffectMode ?? "Static";
+
+            // Sync all = push current global color+mode+speed to every device.
+            foreach (var d in Devices)
+                RememberDeviceEffect(d.Name, color, mode, EffectSpeed, Brightness);
+
+            await Task.Run(() => _openRgb.ApplyEffectToAll(color, mode, speed, bright));
+            StatusText = AppendLastStatus(
+                $"Synced {mode} {color.ToHex()} @ {Brightness:0}% (speed {EffectSpeed:0}) to all devices.");
             await RefreshDevicesAsync();
         }
         catch (Exception ex)
@@ -615,6 +651,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             IsBusy = false;
         }
     }
+
 
     /// <summary>Tray: sync all using last profile if set, otherwise current picker color.</summary>
     [RelayCommand]
@@ -684,43 +721,59 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
         try
         {
+            PersistCurrentDeviceEffectState();
+            var pick = CurrentColor();
+            var globalMode = SelectedEffectMode ?? "Static";
+
             var profile = new ColorProfile
             {
                 Name = ProfileName.Trim(),
                 Brightness = Brightness / 100.0,
+                ModeName = globalMode,
+                Speed = EffectSpeed,
                 Devices = Devices.Select(d =>
                 {
-                    var c = d.CurrentColor ?? CurrentColor();
+                    if (_deviceEffects.TryGetValue(d.Name, out var state))
+                    {
+                        return new DeviceColorEntry
+                        {
+                            DeviceName = d.Name,
+                            R = state.R,
+                            G = state.G,
+                            B = state.B,
+                            ModeName = state.ModeName,
+                            Speed = state.Speed,
+                            Brightness = state.Brightness / 100.0
+                        };
+                    }
+
+                    var c = d.CurrentColor ?? pick;
                     return new DeviceColorEntry
                     {
                         DeviceName = d.Name,
                         R = c.R,
                         G = c.G,
-                        B = c.B
+                        B = c.B,
+                        ModeName = globalMode,
+                        Speed = EffectSpeed,
+                        Brightness = Brightness / 100.0
                     };
                 }).ToList()
             };
-
-            var pick = CurrentColor();
-            foreach (var entry in profile.Devices)
-            {
-                entry.R = pick.R;
-                entry.G = pick.G;
-                entry.B = pick.B;
-            }
 
             _profiles.Save(profile);
             RefreshProfileList();
             SelectedProfileName = profile.Name;
             _settings.LastProfileName = profile.Name;
             PersistSettings();
-            StatusText = $"Saved profile \"{profile.Name}\" → {_profiles.DirectoryPath}";
+            StatusText = $"Saved profile \"{profile.Name}\" (per-device color/mode/speed) → {_profiles.DirectoryPath}";
         }
         catch (Exception ex)
         {
             StatusText = $"Save failed: {ex.Message}";
         }
     }
+
 
     [RelayCommand]
     private async Task LoadProfileAsync()
@@ -745,14 +798,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
         if (!IsConnected)
         {
-            if (profile.Devices.Count > 0)
-            {
-                var first = profile.Devices[0];
-                Red = first.R;
-                Green = first.G;
-                Blue = first.B;
-            }
-            Brightness = Math.Clamp(profile.Brightness * 100.0, 0, 100);
+            ApplyProfileToPicker(profile);
             StatusText = $"Loaded \"{profile.Name}\" into picker (not connected — connect to apply).";
             return;
         }
@@ -762,21 +808,15 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
     private async Task ApplyLoadedProfileAsync(ColorProfile profile, string announcePrefix)
     {
-        Brightness = Math.Clamp(profile.Brightness * 100.0, 0, 100);
-
-        if (profile.Devices.Count > 0)
-        {
-            var first = profile.Devices[0];
-            Red = first.R;
-            Green = first.G;
-            Blue = first.B;
-        }
+        ApplyProfileToPicker(profile);
 
         IsBusy = true;
         try
         {
             var devices = await Task.Run(() => _openRgb.ListDevices());
-            var bright = Brightness / 100.0;
+            var profileBright = Math.Clamp(profile.Brightness, 0, 1);
+            var profileSpeed = Math.Clamp((profile.Speed ?? EffectSpeed) / 100.0, 0, 1);
+            var profileMode = profile.ModeName ?? SelectedEffectMode ?? "Static";
 
             await Task.Run(() =>
             {
@@ -786,11 +826,22 @@ public partial class MainViewModel : ViewModelBase, IDisposable
                         string.Equals(d.Name, entry.DeviceName, StringComparison.OrdinalIgnoreCase));
                     if (match is null)
                         continue;
-                    _openRgb.ApplySolidColor(match.Index, new RgbColor(entry.R, entry.G, entry.B), bright);
+
+                    var color = new RgbColor(entry.R, entry.G, entry.B);
+                    var mode = string.IsNullOrWhiteSpace(entry.ModeName) ? profileMode : entry.ModeName!;
+                    var speed = entry.Speed is double s
+                        ? Math.Clamp(s / 100.0, 0, 1)
+                        : profileSpeed;
+                    var bright = entry.Brightness is double b
+                        ? Math.Clamp(b, 0, 1)
+                        : profileBright;
+
+                    RememberDeviceEffect(match.Name, color, mode, speed * 100.0, bright * 100.0);
+                    _openRgb.ApplyEffect(match.Index, color, mode, speed, bright);
                 }
             });
 
-            StatusText = AppendLastStatus($"{announcePrefix} profile \"{profile.Name}\".");
+            StatusText = AppendLastStatus($"{announcePrefix} profile \"{profile.Name}\" (per-device modes).");
             await RefreshDevicesAsync();
         }
         catch (Exception ex)
@@ -803,6 +854,40 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             IsBusy = false;
         }
     }
+
+    private void ApplyProfileToPicker(ColorProfile profile)
+    {
+        Brightness = Math.Clamp(profile.Brightness * 100.0, 0, 100);
+        if (profile.Speed is double spd)
+            EffectSpeed = Math.Clamp(spd, 0, 100);
+        if (!string.IsNullOrWhiteSpace(profile.ModeName))
+            SelectedEffectMode = profile.ModeName;
+
+        if (profile.Devices.Count > 0)
+        {
+            var first = profile.Devices[0];
+            Red = first.R;
+            Green = first.G;
+            Blue = first.B;
+            if (!string.IsNullOrWhiteSpace(first.ModeName))
+                SelectedEffectMode = first.ModeName;
+            if (first.Speed is double s)
+                EffectSpeed = Math.Clamp(s, 0, 100);
+            if (first.Brightness is double b)
+                Brightness = Math.Clamp(b * 100.0, 0, 100);
+
+            foreach (var entry in profile.Devices)
+            {
+                RememberDeviceEffect(
+                    entry.DeviceName,
+                    new RgbColor(entry.R, entry.G, entry.B),
+                    entry.ModeName ?? profile.ModeName ?? "Static",
+                    entry.Speed ?? profile.Speed ?? EffectSpeed,
+                    (entry.Brightness ?? profile.Brightness) * 100.0);
+            }
+        }
+    }
+
 
     [RelayCommand]
     private void DeleteProfile()
@@ -843,6 +928,146 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     }
 
     private RgbColor CurrentColor() => new((byte)Red, (byte)Green, (byte)Blue);
+
+    private void RebuildEffectModeOptions(DeviceInfo? device)
+    {
+        var previous = SelectedEffectMode;
+        var list = EffectModes.BuildPickerList(device?.Modes);
+        EffectModeOptions.Clear();
+        foreach (var name in list)
+            EffectModeOptions.Add(name);
+
+        if (!string.IsNullOrWhiteSpace(previous) &&
+            EffectModeOptions.Any(n => string.Equals(n, previous, StringComparison.OrdinalIgnoreCase)))
+        {
+            SelectedEffectMode = EffectModeOptions.First(n =>
+                string.Equals(n, previous, StringComparison.OrdinalIgnoreCase));
+        }
+        else if (device?.ActiveModeName is string active &&
+                 EffectModeOptions.Any(n => string.Equals(n, active, StringComparison.OrdinalIgnoreCase)))
+        {
+            SelectedEffectMode = EffectModeOptions.First(n =>
+                string.Equals(n, active, StringComparison.OrdinalIgnoreCase));
+        }
+        else if (EffectModeOptions.Count > 0 &&
+                 (SelectedEffectMode is null ||
+                  !EffectModeOptions.Any(n => string.Equals(n, SelectedEffectMode, StringComparison.OrdinalIgnoreCase))))
+        {
+            SelectedEffectMode = EffectModeOptions.Contains("Static")
+                ? "Static"
+                : EffectModeOptions[0];
+        }
+
+        UpdateEffectSpeedEnabled();
+    }
+
+    private void UpdateEffectSpeedEnabled()
+    {
+        var modeName = SelectedEffectMode ?? "Static";
+        // Off has no meaningful speed; Static often ignores it — still allow slider for CM Breathing etc.
+        if (modeName.Equals("Off", StringComparison.OrdinalIgnoreCase))
+        {
+            EffectSpeedEnabled = false;
+            return;
+        }
+
+        if (SelectedDevice?.Modes is { Count: > 0 } modes)
+        {
+            var match = modes.FirstOrDefault(m =>
+                string.Equals(m.Name, modeName, StringComparison.OrdinalIgnoreCase));
+            if (match is not null)
+            {
+                EffectSpeedEnabled = match.SupportsSpeed ||
+                    CmArgbGen2HidController.IsCoolerMasterArgbGen2(SelectedDevice.Name);
+                return;
+            }
+        }
+
+        // Curated hardware-style modes / CM: enable speed except Off.
+        EffectSpeedEnabled = true;
+    }
+
+    private void PersistCurrentDeviceEffectState()
+    {
+        if (string.IsNullOrWhiteSpace(_effectStateDeviceKey))
+            return;
+
+        RememberDeviceEffect(
+            _effectStateDeviceKey,
+            CurrentColor(),
+            SelectedEffectMode ?? "Static",
+            EffectSpeed,
+            Brightness);
+    }
+
+    private void LoadDeviceEffectState(DeviceInfo? device)
+    {
+        _effectStateDeviceKey = device?.Name;
+
+        if (device is null)
+            return;
+
+        _suppressDeviceEffectSync = true;
+        try
+        {
+            if (_deviceEffects.TryGetValue(device.Name, out var state))
+            {
+                Red = state.R;
+                Green = state.G;
+                Blue = state.B;
+                EffectSpeed = state.Speed;
+                Brightness = state.Brightness;
+                if (!string.IsNullOrWhiteSpace(state.ModeName) &&
+                    EffectModeOptions.Any(n => string.Equals(n, state.ModeName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    SelectedEffectMode = EffectModeOptions.First(n =>
+                        string.Equals(n, state.ModeName, StringComparison.OrdinalIgnoreCase));
+                }
+                else
+                {
+                    SelectedEffectMode = state.ModeName;
+                }
+            }
+            else if (device.CurrentColor is RgbColor c)
+            {
+                Red = c.R;
+                Green = c.G;
+                Blue = c.B;
+                if (!string.IsNullOrWhiteSpace(device.ActiveModeName) &&
+                    EffectModeOptions.Any(n => string.Equals(n, device.ActiveModeName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    SelectedEffectMode = EffectModeOptions.First(n =>
+                        string.Equals(n, device.ActiveModeName, StringComparison.OrdinalIgnoreCase));
+                }
+            }
+        }
+        finally
+        {
+            _suppressDeviceEffectSync = false;
+            UpdateEffectSpeedEnabled();
+        }
+    }
+
+    private void RememberDeviceEffect(
+        string deviceName,
+        RgbColor color,
+        string modeName,
+        double speed0to100,
+        double brightness0to100)
+    {
+        if (string.IsNullOrWhiteSpace(deviceName))
+            return;
+
+        _deviceEffects[deviceName] = new DeviceEffectState
+        {
+            R = color.R,
+            G = color.G,
+            B = color.B,
+            ModeName = string.IsNullOrWhiteSpace(modeName) ? "Static" : modeName,
+            Speed = Math.Clamp(speed0to100, 0, 100),
+            Brightness = Math.Clamp(brightness0to100, 0, 100)
+        };
+    }
 
     public void Dispose()
     {

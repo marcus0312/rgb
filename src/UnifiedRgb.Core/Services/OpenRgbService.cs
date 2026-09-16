@@ -101,14 +101,28 @@ public sealed class OpenRgbService : IOpenRgbService
         }
     }
 
-    public void ApplySolidColor(int deviceIndex, RgbColor color, double brightness01 = 1.0)
+    public void ApplySolidColor(int deviceIndex, RgbColor color, double brightness01 = 1.0) =>
+        ApplyEffect(deviceIndex, color, "Static", speed01: 0.5, brightness01);
+
+    public void ApplySolidColorToAll(RgbColor color, double brightness01 = 1.0) =>
+        ApplyEffectToAll(color, "Static", speed01: 0.5, brightness01);
+
+    public void ApplySolidColorToZone(int deviceIndex, int zoneIndex, RgbColor color, double brightness01 = 1.0) =>
+        ApplyEffectToZone(deviceIndex, zoneIndex, color, "Static", speed01: 0.5, brightness01);
+
+    public void ApplyEffect(
+        int deviceIndex,
+        RgbColor color,
+        string? modeName,
+        double speed01 = 0.5,
+        double brightness01 = 1.0)
     {
         lock (_gate)
         {
             EnsureConnected();
             try
             {
-                var note = ApplyToDevice(deviceIndex, color, brightness01);
+                var note = ApplyEffectToDevice(deviceIndex, color, modeName, speed01, brightness01);
                 LastError = null;
                 LastStatus = note;
             }
@@ -127,7 +141,11 @@ public sealed class OpenRgbService : IOpenRgbService
         }
     }
 
-    public void ApplySolidColorToAll(RgbColor color, double brightness01 = 1.0)
+    public void ApplyEffectToAll(
+        RgbColor color,
+        string? modeName,
+        double speed01 = 0.5,
+        double brightness01 = 1.0)
     {
         lock (_gate)
         {
@@ -153,14 +171,13 @@ public sealed class OpenRgbService : IOpenRgbService
             {
                 try
                 {
-                    var note = ApplyToDevice(i, color, brightness01);
+                    var note = ApplyEffectToDevice(i, color, modeName, speed01, brightness01);
                     ok++;
                     if (!string.IsNullOrWhiteSpace(note))
                         notes.Add(note);
                 }
                 catch (Exception ex)
                 {
-                    // Continue per-device so one HID/SDK failure does not abort the rest.
                     string name;
                     try { name = _client!.GetControllerData(i).Name ?? $"Device {i}"; }
                     catch { name = $"Device {i}"; }
@@ -173,7 +190,7 @@ public sealed class OpenRgbService : IOpenRgbService
                 LastError = string.Join("; ", errors);
                 LastStatus = null;
                 throw new InvalidOperationException(
-                    "Failed to apply color to all devices. " + LastError);
+                    "Failed to apply effect to all devices. " + LastError);
             }
 
             LastError = errors.Count > 0 ? string.Join("; ", errors) : null;
@@ -182,21 +199,24 @@ public sealed class OpenRgbService : IOpenRgbService
                 : (ok > 0 ? $"Applied to {ok} device(s)" : null);
 
             if (errors.Count > 0 && ok > 0)
-            {
-                // Partial success: keep going; surface combined status for UI.
                 LastStatus = $"{LastStatus}; partial errors: {LastError}";
-            }
         }
     }
 
-    public void ApplySolidColorToZone(int deviceIndex, int zoneIndex, RgbColor color, double brightness01 = 1.0)
+    public void ApplyEffectToZone(
+        int deviceIndex,
+        int zoneIndex,
+        RgbColor color,
+        string? modeName,
+        double speed01 = 0.5,
+        double brightness01 = 1.0)
     {
         lock (_gate)
         {
             EnsureConnected();
             try
             {
-                var note = ApplyToZone(deviceIndex, zoneIndex, color, brightness01);
+                var note = ApplyEffectToZoneLocked(deviceIndex, zoneIndex, color, modeName, speed01, brightness01);
                 LastError = null;
                 LastStatus = note;
             }
@@ -395,59 +415,46 @@ public sealed class OpenRgbService : IOpenRgbService
         }
     }
 
-    private string ApplyToDevice(int deviceIndex, RgbColor color, double brightness01)
+    private string ApplyEffectToDevice(
+        int deviceIndex,
+        RgbColor color,
+        string? modeName,
+        double speed01,
+        double brightness01)
     {
         var client = _client!;
         var device = client.GetControllerData(deviceIndex);
         var scaled = color.WithBrightness(brightness01);
         var deviceLabel = device.Name ?? $"Device {deviceIndex}";
+        var modeLabel = string.IsNullOrWhiteSpace(modeName) ? "Static" : modeName.Trim();
+        speed01 = Math.Clamp(speed01, 0, 1);
+        brightness01 = Math.Clamp(brightness01, 0, 1);
 
-        // Cooler Master ARGB Gen2: OpenRGB set_mode/UpdateLeds often leaves Spectrum.
-        // Drive solid color via Windows HID Static only — never follow with OpenRGB Direct
-        // (SetupDirectMode ResetDevice + black LEDs fights HID Static ~1s later).
-        // CM path is HID-only; do not treat ASRock/GALAX/G502 like CM.
-        if (TryApplyCmGen2HidStatic(device.Name, scaled))
+        // Cooler Master ARGB Gen2: HID hardware modes only — never OpenRGB Direct follow-up.
+        if (TryApplyCmGen2HidEffect(device.Name, modeLabel, scaled, speed01, brightness01, out var cmNote))
         {
-            // Optional second HID Static for stickiness; still no OpenRGB sync.
-            Thread.Sleep(CmArgbGen2HidController.InterPacketDelayMs);
-            _ = TryApplyCmGen2HidStatic(device.Name, scaled);
-            return $"{deviceLabel}: HID Static x2 (no OpenRGB follow-up)";
+            // Optional second HID write for Static stickiness; still no OpenRGB sync.
+            if (CmArgbGen2HidController.TryMapModeName(modeLabel) is byte m &&
+                m == CmArgbGen2HidController.HwModeStatic)
+            {
+                Thread.Sleep(CmArgbGen2HidController.InterPacketDelayMs);
+                _ = TryApplyCmGen2HidEffect(device.Name, modeLabel, scaled, speed01, brightness01, out _);
+                return $"{deviceLabel}: {cmNote} x2 (no OpenRGB follow-up)";
+            }
+
+            return $"{deviceLabel}: {cmNote} (no OpenRGB follow-up)";
         }
 
-        // Non-CM backends (each device has its own stack — not CM HID):
-        // - ASRock: no Direct; Static is per-LED (color_mode PER_LED) — UpdateLeds all LEDs
-        // - GALAX: Direct + UpdateLeds (typically 1 LED)
-        // - G502: Direct + UpdateLeds; quit Logitech G HUB (conflicts)
-        // OpenRGB.NET 3.1.1 speaks protocol 4 and sends ordinal indices for UpdateLeds;
-        // protocol-6 servers use unique IDs — always apply colors via proto6 unique-ID path.
-        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
-        var modeNote = EnterWritableMode(client, deviceIndex, device, openRgbColor);
-
-        var ledCount = device.Leds.Length;
-        if (ledCount == 0)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"[UnifiedRgb] Skip UpdateLeds for '{deviceLabel}': LedCount==0 (resize zone or check OpenRGB).");
-            return string.IsNullOrEmpty(modeNote)
-                ? $"{deviceLabel}: skipped (LedCount==0)"
-                : $"{deviceLabel}: {modeNote}; skipped UpdateLeds (LedCount==0)";
-        }
-
-        var protoColors = new (byte R, byte G, byte B)[ledCount];
-        for (var i = 0; i < ledCount; i++)
-            protoColors[i] = (scaled.R, scaled.G, scaled.B);
-
-        OpenRgbProtocol6Client.UpdateLeds(
-            Host, Port, Math.Max(_timeoutMs, 2000),
-            deviceIndex, device.Name, protoColors);
-
-        // Slow SMBus/USB devices (ASRock, GPU, mouse) often need a beat before the next controller.
-        Thread.Sleep(PostUpdateLedsDelayMs);
-        var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
-        return $"{deviceLabel}: {modePart} + proto6 UpdateLeds({ledCount})";
+        return ApplyOpenRgbEffect(deviceIndex, device, scaled, modeLabel, speed01, brightness01, zoneIndex: null);
     }
 
-    private string ApplyToZone(int deviceIndex, int zoneIndex, RgbColor color, double brightness01)
+    private string ApplyEffectToZoneLocked(
+        int deviceIndex,
+        int zoneIndex,
+        RgbColor color,
+        string? modeName,
+        double speed01,
+        double brightness01)
     {
         var client = _client!;
         var device = client.GetControllerData(deviceIndex);
@@ -456,104 +463,322 @@ public sealed class OpenRgbService : IOpenRgbService
 
         var scaled = color.WithBrightness(brightness01);
         var deviceLabel = device.Name ?? $"Device {deviceIndex}";
+        var modeLabel = string.IsNullOrWhiteSpace(modeName) ? "Static" : modeName.Trim();
+        speed01 = Math.Clamp(speed01, 0, 1);
+        brightness01 = Math.Clamp(brightness01, 0, 1);
 
-        // Gen2 Static uses CHANNEL_ALL — solid color applies to the whole hub; HID-only.
-        if (TryApplyCmGen2HidStatic(device.Name, scaled))
+        // Gen2 HW modes use CHANNEL_ALL — applies to the whole hub; HID-only.
+        if (TryApplyCmGen2HidEffect(device.Name, modeLabel, scaled, speed01, brightness01, out var cmNote))
         {
-            Thread.Sleep(CmArgbGen2HidController.InterPacketDelayMs);
-            _ = TryApplyCmGen2HidStatic(device.Name, scaled);
-            return $"{deviceLabel}: HID Static x2 (no OpenRGB follow-up)";
+            if (CmArgbGen2HidController.TryMapModeName(modeLabel) is byte m &&
+                m == CmArgbGen2HidController.HwModeStatic)
+            {
+                Thread.Sleep(CmArgbGen2HidController.InterPacketDelayMs);
+                _ = TryApplyCmGen2HidEffect(device.Name, modeLabel, scaled, speed01, brightness01, out _);
+                return $"{deviceLabel}: {cmNote} x2 (no OpenRGB follow-up)";
+            }
+
+            return $"{deviceLabel}: {cmNote} (no OpenRGB follow-up)";
         }
 
-        // Non-CM: mode enter best-effort via OpenRGB.NET, colors always via proto6 unique IDs.
-        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
-        var modeNote = EnterWritableMode(client, deviceIndex, device, openRgbColor);
-
-        var zone = device.Zones[zoneIndex];
-        var ledCount = (int)zone.LedCount;
-        if (ledCount == 0)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"[UnifiedRgb] Skip UpdateZoneLeds for '{deviceLabel}' zone {zoneIndex}: LedCount==0.");
-            return string.IsNullOrEmpty(modeNote)
-                ? $"{deviceLabel} zone {zoneIndex}: skipped (LedCount==0)"
-                : $"{deviceLabel} zone {zoneIndex}: {modeNote}; skipped UpdateZoneLeds (LedCount==0)";
-        }
-
-        var protoColors = new (byte R, byte G, byte B)[ledCount];
-        for (var i = 0; i < ledCount; i++)
-            protoColors[i] = (scaled.R, scaled.G, scaled.B);
-
-        OpenRgbProtocol6Client.UpdateZoneLeds(
-            Host, Port, Math.Max(_timeoutMs, 2000),
-            deviceIndex, device.Name, zoneIndex, protoColors);
-
-        Thread.Sleep(PostUpdateLedsDelayMs);
-        var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
-        return $"{deviceLabel} zone {zoneIndex}: {modePart} + proto6 UpdateZoneLeds({ledCount})";
+        return ApplyOpenRgbEffect(deviceIndex, device, scaled, modeLabel, speed01, brightness01, zoneIndex);
     }
 
     /// <summary>
-    /// When the OpenRGB device name is Cooler Master ARGB Gen2, send HID Static.
-    /// Throws if matching device but HID write fails on Windows (so UI shows the error).
-    /// Non-Windows / non-CM devices return false and keep the OpenRGB.NET path.
-    /// Intentionally does NOT call OpenRGB SetCustomMode/UpdateMode/UpdateLeds afterward —
-    /// CM Gen2 SetupDirectMode resets the hub and blacks LEDs, undoing HID Static.
+    /// Non-CM: protocol-6 UpdateMode (unique IDs) with speed + mode colors when needed,
+    /// then UpdateLeds / UpdateZoneLeds for Direct or per-LED Static.
     /// </summary>
-    private static bool TryApplyCmGen2HidStatic(string? deviceName, RgbColor scaled)
+    private string ApplyOpenRgbEffect(
+        int deviceIndex,
+        Device device,
+        RgbColor scaled,
+        string modeName,
+        double speed01,
+        double brightness01,
+        int? zoneIndex)
     {
+        var deviceLabel = device.Name ?? $"Device {deviceIndex}";
+        var openRgbColor = new Color(scaled.R, scaled.G, scaled.B);
+
+        var modeMatch = FindMode(device, modeName);
+        string modeNote;
+        Mode? appliedMode = null;
+        var wantsPerLedFollowUp = false;
+
+        if (modeMatch is { } found)
+        {
+            appliedMode = found.Mode;
+            var speed = MapSpeed01(found.Mode, speed01);
+            modeNote = UpdateModeProtocol6(deviceIndex, device, found.Index, found.Mode, speed, openRgbColor);
+            wantsPerLedFollowUp = ModeWantsPerLedFollowUp(found.Mode);
+        }
+        else
+        {
+            // Fall back to writable Direct/Custom/Static enter (legacy solid path).
+            modeNote = EnterWritableMode(deviceIndex, device, openRgbColor, speed01);
+            appliedMode = device.ActiveMode;
+            wantsPerLedFollowUp = true;
+            // Refresh after mode enter so LED counts stay accurate.
+            try { device = _client!.GetControllerData(deviceIndex); } catch { /* keep */ }
+        }
+
+        if (!wantsPerLedFollowUp)
+        {
+            Thread.Sleep(PostUpdateLedsDelayMs);
+            return $"{deviceLabel}: {modeNote} (hardware effect, no UpdateLeds)";
+        }
+
+        if (zoneIndex is int zi)
+        {
+            var zone = device.Zones[zi];
+            var ledCount = (int)zone.LedCount;
+            if (ledCount == 0)
+            {
+                return string.IsNullOrEmpty(modeNote)
+                    ? $"{deviceLabel} zone {zi}: skipped (LedCount==0)"
+                    : $"{deviceLabel} zone {zi}: {modeNote}; skipped UpdateZoneLeds (LedCount==0)";
+            }
+
+            var protoColors = new (byte R, byte G, byte B)[ledCount];
+            for (var i = 0; i < ledCount; i++)
+                protoColors[i] = (scaled.R, scaled.G, scaled.B);
+
+            OpenRgbProtocol6Client.UpdateZoneLeds(
+                Host, Port, Math.Max(_timeoutMs, 2000),
+                deviceIndex, device.Name, zi, protoColors);
+
+            Thread.Sleep(PostUpdateLedsDelayMs);
+            var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
+            return $"{deviceLabel} zone {zi}: {modePart} + proto6 UpdateZoneLeds({ledCount})";
+        }
+        else
+        {
+            var ledCount = device.Leds.Length;
+            if (ledCount == 0)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[UnifiedRgb] Skip UpdateLeds for '{deviceLabel}': LedCount==0.");
+                return string.IsNullOrEmpty(modeNote)
+                    ? $"{deviceLabel}: skipped (LedCount==0)"
+                    : $"{deviceLabel}: {modeNote}; skipped UpdateLeds (LedCount==0)";
+            }
+
+            var protoColors = new (byte R, byte G, byte B)[ledCount];
+            for (var i = 0; i < ledCount; i++)
+                protoColors[i] = (scaled.R, scaled.G, scaled.B);
+
+            OpenRgbProtocol6Client.UpdateLeds(
+                Host, Port, Math.Max(_timeoutMs, 2000),
+                deviceIndex, device.Name, protoColors);
+
+            Thread.Sleep(PostUpdateLedsDelayMs);
+            var modePart = string.IsNullOrEmpty(modeNote) ? "mode unchanged" : modeNote;
+            return $"{deviceLabel}: {modePart} + proto6 UpdateLeds({ledCount})";
+        }
+    }
+
+    private static bool ModeWantsPerLedFollowUp(Mode mode)
+    {
+        var name = mode.Name ?? "";
+        if (name.Contains("Direct", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("Custom", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (mode.Flags.HasFlag(ModeFlags.HasPerLedColor) || mode.ColorMode == ColorMode.PerLed)
+            return true;
+
+        // Static with per-LED colors (ASRock) needs UpdateLeds; mode-specific-only effects do not.
+        if (name.Contains("Static", StringComparison.OrdinalIgnoreCase) &&
+            (mode.Flags.HasFlag(ModeFlags.HasPerLedColor) || mode.ColorMode == ColorMode.PerLed))
+            return true;
+
+        if (mode.ColorMode == ColorMode.ModeSpecific || mode.Flags.HasFlag(ModeFlags.HasModeSpecificColor))
+            return false;
+
+        // Unknown hardware effect: trust UpdateMode alone.
+        if (!name.Contains("Static", StringComparison.OrdinalIgnoreCase) &&
+            !name.Contains("Direct", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return true;
+    }
+
+    private static uint MapSpeed01(Mode mode, double speed01)
+    {
+        speed01 = Math.Clamp(speed01, 0, 1);
+        if (!mode.SupportsSpeed)
+            return mode.Speed;
+
+        var min = mode.SpeedMin;
+        var max = mode.SpeedMax;
+        if (max < min)
+            (min, max) = (max, min);
+        if (max == min)
+            return min;
+
+        return (uint)Math.Round(min + speed01 * (max - min));
+    }
+
+    private string UpdateModeProtocol6(
+        int deviceIndex,
+        Device device,
+        int modeIndex,
+        Mode mode,
+        uint speed,
+        Color solidColor)
+    {
+        var colors = Array.Empty<(byte R, byte G, byte B)>();
+        if (ModeNeedsModeSpecificColors(mode))
+        {
+            var built = BuildModeSpecificColors(mode, solidColor);
+            colors = built.Select(c => (c.R, c.G, c.B)).ToArray();
+        }
+
+        var modeData = OpenRgbProtocol6Client.BuildModeDataProtocol6(
+            mode.Name ?? $"Mode {modeIndex}",
+            (uint)mode.Flags,
+            mode.SpeedMin,
+            mode.SpeedMax,
+            mode.BrightnessMin,
+            mode.BrightnessMax,
+            mode.ColorMin,
+            mode.ColorMax,
+            speed,
+            mode.SupportsBrightness ? mode.Brightness : 0,
+            mode.SupportsDirection ? (uint)mode.Direction : 0,
+            (uint)mode.ColorMode,
+            colors);
+
+        try
+        {
+            OpenRgbProtocol6Client.UpdateMode(
+                Host, Port, Math.Max(_timeoutMs, 2000),
+                deviceIndex, device.Name, modeIndex, modeData);
+
+            var colorNote = colors.Length > 0 ? "+colors" : "";
+            var speedNote = mode.SupportsSpeed ? $", speed={speed}" : "";
+            return $"proto6 UpdateMode({mode.Name}{colorNote}{speedNote})";
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[UnifiedRgb] proto6 UpdateMode({mode.Name}) failed: {ex.Message}; trying OpenRGB.NET");
+
+            // Fallback: OpenRGB.NET ordinal UpdateMode (may mis-target on some servers).
+            try
+            {
+                Color[]? netColors = colors.Length > 0
+                    ? colors.Select(c => new Color(c.R, c.G, c.B)).ToArray()
+                    : null;
+                _client!.UpdateMode(
+                    deviceIndex,
+                    modeIndex,
+                    mode.SupportsSpeed ? speed : null,
+                    null,
+                    netColors);
+                return $"UpdateMode({mode.Name}) via OpenRGB.NET (proto6 failed: {ex.Message})";
+            }
+            catch (Exception ex2)
+            {
+                throw new InvalidOperationException(
+                    $"UpdateMode({mode.Name}) failed: {ex.Message}; fallback: {ex2.Message}", ex);
+            }
+        }
+    }
+
+    private static (int Index, Mode Mode)? FindMode(Device device, string modeName)
+    {
+        if (device.Modes is null || device.Modes.Length == 0)
+            return null;
+
+        // Exact (ignore case)
+        for (var i = 0; i < device.Modes.Length; i++)
+        {
+            var m = device.Modes[i];
+            if (EffectModes.NamesMatch(m.Name, modeName))
+                return (i, m);
+        }
+
+        // Contains either way
+        for (var i = 0; i < device.Modes.Length; i++)
+        {
+            var m = device.Modes[i];
+            var name = m.Name ?? "";
+            if (name.Contains(modeName, StringComparison.OrdinalIgnoreCase) ||
+                modeName.Contains(name, StringComparison.OrdinalIgnoreCase))
+                return (i, m);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// When the OpenRGB device name is Cooler Master ARGB Gen2, send HID hardware mode.
+    /// Throws if matching device but HID write fails on Windows (so UI shows the error).
+    /// Non-Windows / non-CM devices return false and keep the OpenRGB path.
+    /// </summary>
+    private static bool TryApplyCmGen2HidEffect(
+        string? deviceName,
+        string modeName,
+        RgbColor scaled,
+        double speed01,
+        double brightness01,
+        out string note)
+    {
+        note = "";
         if (!CmArgbGen2HidController.IsCoolerMasterArgbGen2(deviceName))
             return false;
 
-        if (CmArgbGen2HidController.TrySetStaticColor(scaled.R, scaled.G, scaled.B, out var hidError))
+        if (CmArgbGen2HidController.TryApplyNamedMode(
+                modeName, speed01, brightness01, scaled.R, scaled.G, scaled.B,
+                out var statusOrError, out var isError))
+        {
+            note = statusOrError ?? "HID OK";
             return true;
+        }
 
         if (!OperatingSystem.IsWindows())
             return false;
 
         throw new InvalidOperationException(
-            hidError ?? "Cooler Master ARGB Gen2 HID Static failed.");
+            statusOrError ?? "Cooler Master ARGB Gen2 HID mode failed.");
     }
 
     private const int PostUpdateLedsDelayMs = 50;
 
     /// <summary>
-    /// Enter a writable lighting mode for Apply-to-selected (one device at a time).
-    /// Best-effort via OpenRGB.NET (protocol 4 ordinals); colors are applied afterward
-    /// via protocol-6 unique-ID UpdateLeds. Order: Direct (GALAX/G502) → Custom →
-    /// SetCustomMode → Static (ASRock — no Direct; Static is often PER_LED).
-    /// Returns a short note for LastStatus.
+    /// Enter a writable lighting mode when the requested named mode is missing.
+    /// Best-effort via protocol-6 UpdateMode; colors applied afterward via UpdateLeds.
     /// </summary>
-    private static string EnterWritableMode(
-        OpenRgbClient client, int deviceIndex, Device device, Color solidColor)
+    private string EnterWritableMode(
+        int deviceIndex, Device device, Color solidColor, double speed01)
     {
-        // Named Direct first so GPU/mouse get per-LED Direct, not a vague SetCustomMode.
-        if (TryUpdateNamedMode(client, deviceIndex, device, solidColor, "Direct", out var note))
+        if (TryUpdateNamedMode(deviceIndex, device, solidColor, speed01, "Direct", out var note))
             return note;
-        if (TryUpdateNamedMode(client, deviceIndex, device, solidColor, "Custom", out note))
+        if (TryUpdateNamedMode(deviceIndex, device, solidColor, speed01, "Custom", out note))
             return note;
 
         try
         {
-            client.SetCustomMode(deviceIndex);
+            _client!.SetCustomMode(deviceIndex);
             return "SetCustomMode";
         }
         catch
         {
-            // Static-only boards (e.g. some ASRock Polychrome) reject SetCustomMode.
+            // Static-only boards reject SetCustomMode.
         }
 
-        if (TryUpdateNamedMode(client, deviceIndex, device, solidColor, "Static", out note))
+        if (TryUpdateNamedMode(deviceIndex, device, solidColor, speed01, "Static", out note))
             return note;
 
         return "";
     }
 
-    private static bool TryUpdateNamedMode(
-        OpenRgbClient client,
+    private bool TryUpdateNamedMode(
         int deviceIndex,
         Device device,
         Color solidColor,
+        double speed01,
         string needle,
         out string note)
     {
@@ -567,16 +792,8 @@ public sealed class OpenRgbService : IOpenRgbService
 
             try
             {
-                if (ModeNeedsModeSpecificColors(mode))
-                {
-                    var modeColors = BuildModeSpecificColors(mode, solidColor);
-                    client.UpdateMode(deviceIndex, i, colors: modeColors);
-                    note = $"UpdateMode({name}+colors)";
-                    return true;
-                }
-
-                client.UpdateMode(deviceIndex, i);
-                note = $"UpdateMode({name})";
+                var speed = MapSpeed01(mode, speed01);
+                note = UpdateModeProtocol6(deviceIndex, device, i, mode, speed, solidColor);
                 return true;
             }
             catch (Exception ex)
@@ -623,6 +840,24 @@ public sealed class OpenRgbService : IOpenRgbService
         }
 
         var mode = d.ActiveMode;
+        var modes = new List<ModeInfo>(d.Modes.Length);
+        for (var i = 0; i < d.Modes.Length; i++)
+        {
+            var m = d.Modes[i];
+            modes.Add(new ModeInfo
+            {
+                Index = i,
+                Name = m.Name ?? $"Mode {i}",
+                SupportsSpeed = m.SupportsSpeed,
+                SpeedMin = m.SpeedMin,
+                SpeedMax = m.SpeedMax,
+                SupportsBrightness = m.SupportsBrightness,
+                HasPerLedColor = m.Flags.HasFlag(ModeFlags.HasPerLedColor) || m.ColorMode == ColorMode.PerLed,
+                HasModeSpecificColor = m.Flags.HasFlag(ModeFlags.HasModeSpecificColor) || m.ColorMode == ColorMode.ModeSpecific,
+                ColorMode = m.ColorMode.ToString()
+            });
+        }
+
         return new DeviceInfo
         {
             Index = index,
@@ -633,10 +868,15 @@ public sealed class OpenRgbService : IOpenRgbService
             LedCount = d.Leds.Length,
             ActiveModeName = mode?.Name,
             ActiveModeSupportsBrightness = mode?.SupportsBrightness == true,
+            ActiveModeSupportsSpeed = mode?.SupportsSpeed == true,
             Brightness = mode?.SupportsBrightness == true ? mode.Brightness : null,
             BrightnessMin = mode?.SupportsBrightness == true ? mode.BrightnessMin : null,
             BrightnessMax = mode?.SupportsBrightness == true ? mode.BrightnessMax : null,
+            Speed = mode?.SupportsSpeed == true ? mode.Speed : null,
+            SpeedMin = mode?.SupportsSpeed == true ? mode.SpeedMin : null,
+            SpeedMax = mode?.SupportsSpeed == true ? mode.SpeedMax : null,
             CurrentColor = current,
+            Modes = modes,
             Zones = d.Zones.Select(z => new ZoneInfo
             {
                 Index = z.Index,

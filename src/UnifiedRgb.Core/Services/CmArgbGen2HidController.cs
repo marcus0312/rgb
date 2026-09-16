@@ -3,14 +3,33 @@ using HidSharp;
 namespace UnifiedRgb.Core.Services;
 
 /// <summary>
-/// Windows HID Static control for Cooler Master ARGB Gen 2 A1 V2 (VID 0x2516 / PID 0x01C9).
-/// OpenRGB UpdateMode ACKs but often leaves Spectrum/rainbow; raw HID Static works.
-/// Packet layout from OpenRGB CMARGBGen2A1Controller.h / verified on Marcus_PC.
+/// Windows HID control for Cooler Master ARGB Gen 2 A1 V2 (VID 0x2516 / PID 0x01C9).
+/// OpenRGB UpdateMode ACKs but often leaves Spectrum/rainbow; raw HID HW_MODE_SETUP works.
+/// Packet layout and mode bytes from OpenRGB CMARGBGen2A1Controller.h / verified on Marcus_PC.
 /// </summary>
 public static class CmArgbGen2HidController
 {
     public const int VendorId = 0x2516;
     public const int ProductId = 0x01C9;
+
+    // CM_ARGB_GEN2_A1_*_MODE from CMARGBGen2A1Controller.h
+    public const byte HwModeSpectrum = 0x00;
+    public const byte HwModeStatic = 0x01;
+    public const byte HwModeReload = 0x02;
+    public const byte HwModeRecoil = 0x03;
+    public const byte HwModeBreathing = 0x04;
+    public const byte HwModeRefill = 0x05;
+    public const byte HwModeDemo = 0x06;
+    public const byte HwModeFillFlow = 0x07;
+    public const byte HwModeRainbow = 0x08;
+    public const byte HwModeOff = 0x09;
+    public const byte HwModeCustom = 0xC0;
+
+    public const byte SpeedMin = 0x00;
+    public const byte SpeedHalf = 0x02;
+    public const byte SpeedMax = 0x04;
+    public const byte BrightnessMin = 0x00;
+    public const byte BrightnessMax = 0xFF;
 
     private const byte Cmd = 0x80;
     private const byte Write = 0x02;
@@ -19,9 +38,6 @@ public static class CmArgbGen2HidController
     private const byte ApplyChanges = 0xB0;
     private const byte ChannelAll = 0xFF;
     private const byte SubchannelAll = 0xFF;
-    private const byte StaticMode = 0x01;
-    private const byte DefaultSpeed = 0x02;
-    private const byte FullBrightness = 0xFF;
 
     private const int PacketLengthWithReportId = 65; // report id 0 + 64 payload
     private const int PacketLengthPayloadOnly = 64;
@@ -34,19 +50,79 @@ public static class CmArgbGen2HidController
         deviceName.Contains("Cooler Master ARGB", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Send HID Static solid color on Windows. Writes to all preferred interfaces
-    /// (MI_01 then MI_00; skips MI_02 mouse). Succeeds if any interface accepts the write.
+    /// Map a UI / OpenRGB mode name to a CM Gen2 hardware mode byte.
+    /// Direct/Custom map to Static (solid) — we never follow with OpenRGB Direct.
+    /// Returns null when the name is not a known CM hardware effect.
     /// </summary>
-    public static bool TrySetStaticColor(byte r, byte g, byte b, out string? error) =>
-        TrySetStaticColor(r, g, b, FullBrightness, apply: true, out error);
+    public static byte? TryMapModeName(string? modeName)
+    {
+        if (string.IsNullOrWhiteSpace(modeName))
+            return HwModeStatic;
 
-    public static bool TrySetStaticColor(byte r, byte g, byte b, byte brightness, bool apply, out string? error)
+        var n = modeName.Trim();
+        if (Contains(n, "off")) return HwModeOff;
+        if (Contains(n, "spectrum")) return HwModeSpectrum;
+        if (Contains(n, "rainbow")) return HwModeRainbow;
+        if (Contains(n, "breath")) return HwModeBreathing;
+        if (Contains(n, "reload")) return HwModeReload;
+        if (Contains(n, "recoil")) return HwModeRecoil;
+        if (Contains(n, "refill")) return HwModeRefill;
+        if (Contains(n, "demo")) return HwModeDemo;
+        if (Contains(n, "fill") && Contains(n, "flow")) return HwModeFillFlow;
+        if (Contains(n, "fill flow")) return HwModeFillFlow;
+        if (Contains(n, "static")) return HwModeStatic;
+        // Direct / Custom / per-LED software modes → solid Static HID (no OpenRGB Direct).
+        if (Contains(n, "direct") || Contains(n, "custom")) return HwModeStatic;
+        return null;
+    }
+
+    /// <summary>Map UI speed 0–100 to CM HID speed byte (0x00–0x04).</summary>
+    public static byte MapSpeed01ToHw(double speed01)
+    {
+        speed01 = Math.Clamp(speed01, 0, 1);
+        return (byte)Math.Round(SpeedMin + speed01 * (SpeedMax - SpeedMin));
+    }
+
+    /// <summary>Map brightness 0–1 to CM HID brightness byte.</summary>
+    public static byte MapBrightness01ToHw(double brightness01) =>
+        (byte)Math.Round(Math.Clamp(brightness01, 0, 1) * BrightnessMax);
+
+    /// <summary>Send HID Static solid color on Windows (existing solid path).</summary>
+    public static bool TrySetStaticColor(byte r, byte g, byte b, out string? error) =>
+        TrySetStaticColor(r, g, b, BrightnessMax, apply: true, out error);
+
+    public static bool TrySetStaticColor(byte r, byte g, byte b, byte brightness, bool apply, out string? error) =>
+        TrySetHardwareMode(HwModeStatic, SpeedHalf, brightness, r, g, b, apply, out error);
+
+    /// <summary>
+    /// Send HID hardware mode (LIGHTNING_CONTROL → HW_MODE_SETUP → optional APPLY_CHANGES).
+    /// Same packet layout as OpenRGB CMARGBGen2A1Controller::SetMode.
+    /// </summary>
+    public static bool TrySetHardwareMode(
+        byte mode,
+        byte speed,
+        byte brightness,
+        byte r,
+        byte g,
+        byte b,
+        out string? error) =>
+        TrySetHardwareMode(mode, speed, brightness, r, g, b, apply: true, out error);
+
+    public static bool TrySetHardwareMode(
+        byte mode,
+        byte speed,
+        byte brightness,
+        byte r,
+        byte g,
+        byte b,
+        bool apply,
+        out string? error)
     {
         error = null;
 
         if (!OperatingSystem.IsWindows())
         {
-            error = "CM Gen2 HID Static is only implemented for Windows.";
+            error = "CM Gen2 HID modes are only implemented for Windows.";
             return false;
         }
 
@@ -68,8 +144,6 @@ public static class CmArgbGen2HidController
             Exception? lastWriteError = null;
             var openFailures = 0;
 
-            // Write to every preferred interface. MI_00 may accept writes without driving LEDs;
-            // MI_01 is tried first and both are always attempted when present.
             foreach (var device in candidates)
             {
                 try
@@ -82,7 +156,7 @@ public static class CmArgbGen2HidController
 
                     using (stream)
                     {
-                        WriteStaticSequence(stream, device, r, g, b, brightness, apply);
+                        WriteModeSequence(stream, device, mode, speed, brightness, r, g, b, apply);
                     }
 
                     anySuccess = true;
@@ -113,19 +187,76 @@ public static class CmArgbGen2HidController
         }
     }
 
-    private static void WriteStaticSequence(
-        HidStream stream,
-        HidDevice device,
+    /// <summary>Resolve mode name + UI speed/brightness/color into a HID write.</summary>
+    public static bool TryApplyNamedMode(
+        string? modeName,
+        double speed01,
+        double brightness01,
         byte r,
         byte g,
         byte b,
+        out string? statusOrError,
+        out bool isError)
+    {
+        isError = false;
+        var mapped = TryMapModeName(modeName);
+        if (mapped is null)
+        {
+            // Unknown name → Static solid (preserves old solid behavior).
+            mapped = HwModeStatic;
+        }
+
+        var speed = MapSpeed01ToHw(speed01);
+        var brightness = MapBrightness01ToHw(brightness01);
+        var modeByte = mapped.Value;
+        var modeLabel = ModeByteLabel(modeByte);
+
+        if (!TrySetHardwareMode(modeByte, speed, brightness, r, g, b, out var error))
+        {
+            isError = true;
+            statusOrError = error ?? "CM Gen2 HID mode failed.";
+            return false;
+        }
+
+        statusOrError = $"HID {modeLabel} (mode=0x{modeByte:X2}, speed={speed}, bright={brightness})";
+        return true;
+    }
+
+    public static string ModeByteLabel(byte mode) => mode switch
+    {
+        HwModeSpectrum => "Spectrum",
+        HwModeStatic => "Static",
+        HwModeReload => "Reload",
+        HwModeRecoil => "Recoil",
+        HwModeBreathing => "Breathing",
+        HwModeRefill => "Refill",
+        HwModeDemo => "Demo",
+        HwModeFillFlow => "Fill Flow",
+        HwModeRainbow => "Rainbow",
+        HwModeOff => "Off",
+        HwModeCustom => "Custom",
+        _ => $"Mode0x{mode:X2}"
+    };
+
+    private static bool Contains(string haystack, string needle) =>
+        haystack.Contains(needle, StringComparison.OrdinalIgnoreCase);
+
+    private static void WriteModeSequence(
+        HidStream stream,
+        HidDevice device,
+        byte mode,
+        byte speed,
         byte brightness,
+        byte r,
+        byte g,
+        byte b,
         bool apply)
     {
+        // Leave software/direct mode if the hub was previously in CUSTOM (OpenRGB Direct).
         WritePacketFlexible(stream, device, BuildLightningControl);
         Thread.Sleep(InterPacketDelayMs);
 
-        WritePacketFlexible(stream, device, len => BuildHwModeSetupStatic(len, r, g, b, brightness));
+        WritePacketFlexible(stream, device, len => BuildHwModeSetup(len, mode, speed, brightness, r, g, b));
         Thread.Sleep(InterPacketDelayMs);
 
         if (apply)
@@ -177,8 +308,6 @@ public static class CmArgbGen2HidController
             maxOut = PacketLengthWithReportId;
         }
 
-        // Prefer report-id-prefixed 65 when the device advertises >= 65 (or unknown).
-        // When max is exactly 64, try 64 first then 65 as fallback (some stacks are picky).
         if (maxOut == PacketLengthPayloadOnly)
             return new[] { PacketLengthPayloadOnly, PacketLengthWithReportId };
 
@@ -191,14 +320,12 @@ public static class CmArgbGen2HidController
     private static bool IsPreferredInterface(HidDevice device)
     {
         var path = device.DevicePath ?? "";
-        // Avoid MI_02 (mouse composite). Prefer MI_00 / MI_01 (usage_page 0xFF00/0xFF01).
         if (path.Contains("MI_02", StringComparison.OrdinalIgnoreCase))
             return false;
         if (path.Contains("MI_00", StringComparison.OrdinalIgnoreCase) ||
             path.Contains("MI_01", StringComparison.OrdinalIgnoreCase))
             return true;
 
-        // If path has no MI_ tag, still try (some stacks omit it).
         return !path.Contains("MI_", StringComparison.OrdinalIgnoreCase);
     }
 
@@ -214,7 +341,6 @@ public static class CmArgbGen2HidController
     private static byte[] BuildLightningControl(int length)
     {
         var p = new byte[length];
-        // length 65: [0]=report id, [1..]=payload. length 64: payload starts at [0].
         var o = length >= PacketLengthWithReportId ? 1 : 0;
         if (o == 1)
             p[0] = 0;
@@ -224,7 +350,14 @@ public static class CmArgbGen2HidController
         return p;
     }
 
-    private static byte[] BuildHwModeSetupStatic(int length, byte r, byte g, byte b, byte brightness)
+    private static byte[] BuildHwModeSetup(
+        int length,
+        byte mode,
+        byte speed,
+        byte brightness,
+        byte r,
+        byte g,
+        byte b)
     {
         var p = new byte[length];
         var o = length >= PacketLengthWithReportId ? 1 : 0;
@@ -235,8 +368,8 @@ public static class CmArgbGen2HidController
         p[o + 2] = Write;
         p[o + 3] = ChannelAll;
         p[o + 4] = SubchannelAll;
-        p[o + 5] = StaticMode;
-        p[o + 6] = DefaultSpeed;
+        p[o + 5] = mode;
+        p[o + 6] = speed;
         p[o + 7] = brightness;
         p[o + 8] = r;
         p[o + 9] = g;

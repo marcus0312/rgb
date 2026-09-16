@@ -157,13 +157,27 @@
               </DockPanel>
 
               <DockPanel>
+                <TextBlock Text="Effect" Width="56" VerticalAlignment="Center" />
+                <ComboBox ItemsSource="{Binding EffectModeOptions}"
+                          SelectedItem="{Binding SelectedEffectMode}"
+                          HorizontalAlignment="Stretch"
+                          PlaceholderText="Mode…" />
+              </DockPanel>
+              <DockPanel>
+                <TextBlock Text="Speed" Width="56" VerticalAlignment="Center" />
+                <Slider Minimum="0" Maximum="100" Value="{Binding EffectSpeed}"
+                        TickFrequency="1" IsSnapToTickEnabled="True"
+                        IsEnabled="{Binding EffectSpeedEnabled}" />
+              </DockPanel>
+
+              <DockPanel>
                 <Button DockPanel.Dock="Right" Content="Parse" Margin="8,0,0,0"
                         Command="{Binding ParseHexCommand}" />
                 <TextBox Text="{Binding ColorHex}" Watermark="#RRGGBB" />
               </DockPanel>
 
               <TextBlock FontSize="11" Opacity="0.65" TextWrapping="Wrap"
-                         Text="Apply uses the selected channel when set. If LED count is 0, it auto-applies size (default 24, ConfigureZone for CM Gen2) then UpdateZoneLeds." />
+                         Text="Apply sends mode + color + speed. Selected device keeps its own color/mode. Sync all pushes the current global effect to every device. CM Gen2 uses HID hardware modes; others use OpenRGB protocol-6 UpdateMode (+ UpdateLeds for Direct/per-LED Static)." />
               <Button Content="Apply to selected" Command="{Binding ApplyToSelectedCommand}"
                       HorizontalAlignment="Stretch" IsEnabled="{Binding IsConnected}" />
               <Button Content="Sync all devices" Command="{Binding ApplyToAllCommand}"
